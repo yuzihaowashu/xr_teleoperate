@@ -31,9 +31,13 @@ kTopicDex3LeftState = "rt/dex3/left/state"
 kTopicDex3RightState = "rt/dex3/right/state"
 
 
+DEX3_OPEN_Q  = np.zeros(Dex3_Num_Motors)
+DEX3_CLOSE_Q = np.array([0.8, 0.8, 1.2, -1.2, -1.4, -1.2, -1.4])
+
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
-                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False):
+                       dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False,
+                       left_trigger_value = None, right_trigger_value = None):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -91,7 +95,8 @@ class Dex3_1_Controller:
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
         hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out))
+                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
+                                                                          left_trigger_value, right_trigger_value))
         hand_control_process.daemon = True
         hand_control_process.start()
 
@@ -135,7 +140,8 @@ class Dex3_1_Controller:
         # logger_mp.debug("hand ctrl publish ok.")
     
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
-                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None):
+                              dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None,
+                              left_trigger_value = None, right_trigger_value = None):
         self.running = True
 
         left_q_target  = np.full(Dex3_Num_Motors, 0)
@@ -183,7 +189,12 @@ class Dex3_1_Controller:
                 # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
-                if not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
+                if left_trigger_value is not None and right_trigger_value is not None:
+                    lt = np.clip(left_trigger_value.value, 0.0, 1.0)
+                    rt = np.clip(right_trigger_value.value, 0.0, 1.0)
+                    left_q_target  = DEX3_OPEN_Q * (1.0 - lt) + DEX3_CLOSE_Q * lt
+                    right_q_target = DEX3_OPEN_Q * (1.0 - rt) + DEX3_CLOSE_Q * rt
+                elif not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 

@@ -2,9 +2,37 @@ import time
 import argparse
 from multiprocessing import Value, Array, Lock
 import threading
+import queue
 import logging_mp
 logging_mp.basicConfig(level=logging_mp.INFO)
 logger_mp = logging_mp.getLogger(__name__)
+
+# --- Non-blocking TTS via background thread ---
+_tts_queue: queue.Queue = queue.Queue()
+
+def _tts_worker():
+    try:
+        import pyttsx3
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 160)
+    except Exception:
+        return
+    while True:
+        text = _tts_queue.get()
+        if text is None:
+            break
+        try:
+            engine.say(text)
+            engine.runAndWait()
+        except Exception:
+            pass
+
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+_tts_thread.start()
+
+def speak(text: str):
+    """Queue a TTS message for non-blocking playback."""
+    _tts_queue.put_nowait(text)
 
 import os 
 import sys
@@ -55,6 +83,8 @@ def on_press(key):
     elif key == 'q':
         START = False
         STOP = True
+        speak("Stop teleoperation")
+        logger_mp.info("[keyboard] q pressed — STOP=True")
     elif key == 's' and START == True:
         RECORD_TOGGLE = True
     else:
@@ -165,8 +195,11 @@ if __name__ == '__main__':
             dual_hand_data_lock = Lock()
             dual_hand_state_array = Array('d', 14, lock = False)   # [output] current left, right hand state(14) data.
             dual_hand_action_array = Array('d', 14, lock = False)  # [output] current left, right hand action(14) data.
+            left_trigger_value = Value('d', 0.0) if args.input_mode == "controller" else None
+            right_trigger_value = Value('d', 0.0) if args.input_mode == "controller" else None
             hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
-                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim)
+                                          dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim,
+                                          left_trigger_value=left_trigger_value, right_trigger_value=right_trigger_value)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
             left_gripper_value = Value('d', 0.0, lock=True)        # [input]
@@ -248,14 +281,26 @@ if __name__ == '__main__':
         logger_mp.info("🔴  Press [q] to stop and exit the program.")
         logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
         READY = True                  # now ready to (1) enter START state
+        _x_button_held = False
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
-                tv_wrapper.render_to_xr(head_img)
+                if head_img is not None and head_img.bgr is not None:
+                    tv_wrapper.render_to_xr(head_img.bgr)
+            if args.input_mode == "controller" and hasattr(tv_wrapper, 'tvuer'):
+                if tv_wrapper.tvuer.left_ctrl_aButton:
+                    if not _x_button_held:
+                        _x_button_held = True
+                        START = True
+                        logger_mp.info("[VR] Left X button pressed → start tracking")
+                else:
+                    _x_button_held = False
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
+        speak("Start teleoperation")
         arm_ctrl.speed_gradual_max()
+        _b_button_held = False
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
@@ -263,8 +308,8 @@ if __name__ == '__main__':
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
-                if xr_need_local_img:
-                    tv_wrapper.render_to_xr(head_img)
+                if xr_need_local_img and head_img is not None and head_img.bgr is not None:
+                    tv_wrapper.render_to_xr(head_img.bgr)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -278,11 +323,14 @@ if __name__ == '__main__':
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
+                        speak("Start recording")
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
+                        speak("Recording failed")
                 else:
                     RECORD_RUNNING = False
                     recorder.save_episode()
+                    speak("Stop recording. Episode saved.")
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
 
@@ -293,6 +341,9 @@ if __name__ == '__main__':
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
                 with right_hand_pos_array.get_lock():
                     right_hand_pos_array[:] = tele_data.right_hand_pos.flatten()
+            elif args.ee == "dex3" and args.input_mode == "controller":
+                left_trigger_value.value = tele_data.left_ctrl_triggerValue
+                right_trigger_value.value = tele_data.right_ctrl_triggerValue
             elif args.ee == "dex1" and args.input_mode == "controller":
                 with left_gripper_value.get_lock():
                     left_gripper_value.value = tele_data.left_ctrl_triggerValue
@@ -310,15 +361,28 @@ if __name__ == '__main__':
             if args.input_mode == "controller" and args.motion:
                 # quit teleoperate
                 if tele_data.right_ctrl_aButton:
+                    loco_wrapper.Move(0, 0, 0)
                     START = False
                     STOP = True
+                    speak("Stop teleoperation")
+                    continue
+                # B button: toggle recording (same as keyboard [s])
+                if args.record and tele_data.right_ctrl_bButton:
+                    if not _b_button_held:
+                        _b_button_held = True
+                        RECORD_TOGGLE = True
+                        logger_mp.info("[VR] Right B button pressed → toggle recording")
+                else:
+                    _b_button_held = False
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
                 # https://github.com/unitreerobotics/xr_teleoperate/issues/135, control, limit velocity to within 0.3
-                loco_wrapper.Move(-tele_data.left_ctrl_thumbstickValue[1] * 0.3,
-                                  -tele_data.left_ctrl_thumbstickValue[0] * 0.3,
-                                  -tele_data.right_ctrl_thumbstickValue[0]* 0.3)
+                _deadzone = 0.15
+                _lx = tele_data.left_ctrl_thumbstickValue[0] if abs(tele_data.left_ctrl_thumbstickValue[0]) > _deadzone else 0.0
+                _ly = tele_data.left_ctrl_thumbstickValue[1] if abs(tele_data.left_ctrl_thumbstickValue[1]) > _deadzone else 0.0
+                _rx = tele_data.right_ctrl_thumbstickValue[0] if abs(tele_data.right_ctrl_thumbstickValue[0]) > _deadzone else 0.0
+                loco_wrapper.Move(-_ly * 0.3, -_lx * 0.3, -_rx * 0.3)
 
             # get current robot state data.
             current_lr_arm_q  = arm_ctrl.get_current_dual_arm_q()
@@ -485,6 +549,13 @@ if __name__ == '__main__':
         logger_mp.error(traceback.format_exc())
     finally:
         try:
+            if args.motion and args.input_mode == "controller":
+                loco_wrapper.Move(0, 0, 0)
+                logger_mp.info("Sent Move(0,0,0) — locomotion stopped.")
+        except Exception as e:
+            logger_mp.error(f"Failed to stop locomotion: {e}")
+
+        try:
             arm_ctrl.ctrl_dual_arm_go_home()
         except Exception as e:
             logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
@@ -527,5 +598,8 @@ if __name__ == '__main__':
                 recorder.close()
         except Exception as e:
             logger_mp.error(f"Failed to close recorder: {e}")
+        speak("Teleoperation ended")
+        time.sleep(1.5)
+        _tts_queue.put(None)
         logger_mp.info("✅ Finally, exiting program.")
         exit(0)
