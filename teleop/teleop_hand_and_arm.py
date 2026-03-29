@@ -34,11 +34,37 @@ def speak(text: str):
     """Queue a TTS message for non-blocking playback."""
     _tts_queue.put_nowait(text)
 
+import cv2
+import numpy as np
 import os 
 import sys
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.append(parent_dir)
+
+def draw_vr_hud(frame, tracking_active, recording, vr_connected, paused):
+    """Overlay a minimal status HUD on the camera frame for VR display."""
+    if frame is None:
+        return frame
+    h, w = frame.shape[:2]
+    overlay = frame.copy()
+
+    if recording:
+        cv2.circle(overlay, (30, 30), 12, (0, 0, 255), -1)
+        cv2.putText(overlay, "REC", (50, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+    elif tracking_active:
+        cv2.circle(overlay, (30, 30), 12, (0, 200, 0), -1)
+        cv2.putText(overlay, "READY", (50, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 0), 2)
+
+    if paused:
+        label = "PAUSED — press X"
+        cv2.putText(overlay, label, (w // 2 - 160, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+    elif not vr_connected:
+        label = "VR DISCONNECTED"
+        cv2.putText(overlay, label, (w // 2 - 160, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    return frame
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize # dds 
 from televuer import TeleVuerWrapper
@@ -272,14 +298,26 @@ if __name__ == '__main__':
                                      frequency = args.frequency, 
                                      rerun_log = not args.headless)
 
-        logger_mp.info("----------------------------------------------------------------")
-        logger_mp.info("🟢  Press [r] to start syncing the robot with your movements.")
-        if args.record:
-            logger_mp.info("🟡  Press [s] to START or SAVE recording (toggle cycle).")
-        else:
-            logger_mp.info("🔵  Recording is DISABLED (run with --record to enable).")
-        logger_mp.info("🔴  Press [q] to stop and exit the program.")
-        logger_mp.info("⚠️  IMPORTANT: Please keep your distance and stay safe.")
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.table import Table
+            _con = Console()
+            _tbl = Table(show_header=False, box=None, padding=(0, 2))
+            _tbl.add_column(style="bold")
+            _tbl.add_column()
+            _tbl.add_row("[green]Keyboard [r][/]", "Start tracking")
+            _tbl.add_row("[green]VR Left X[/]", "Start tracking (controller mode)")
+            if args.record:
+                _tbl.add_row("[yellow]Keyboard [s] / VR Right B[/]", "Toggle recording")
+            _tbl.add_row("[red]Keyboard [q] / VR Right A[/]", "Stop & exit")
+            _tbl.add_row("[cyan]Both joysticks pressed[/]", "Emergency damping")
+            _con.print(Panel(_tbl, title="[bold]XR Teleoperate[/]",
+                             subtitle=f"arm={args.arm}  ee={args.ee}  input={args.input_mode}  record={'ON' if args.record else 'OFF'}",
+                             border_style="blue"))
+            _con.print("[bold yellow]⚠  Keep safe distance from the robot![/]")
+        except ImportError:
+            logger_mp.info("Press [r] to start, [s] to toggle recording, [q] to quit.")
         READY = True                  # now ready to (1) enter START state
         _x_button_held = False
         while not START and not STOP: # wait for start or stop signal.
@@ -287,7 +325,8 @@ if __name__ == '__main__':
             if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
                 head_img = img_client.get_head_frame()
                 if head_img is not None and head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                    _frame = draw_vr_hud(head_img.bgr.copy(), False, False, True, True)
+                    tv_wrapper.render_to_xr(_frame)
             if args.input_mode == "controller" and hasattr(tv_wrapper, 'tvuer'):
                 if tv_wrapper.tvuer.left_ctrl_aButton:
                     if not _x_button_held:
@@ -301,15 +340,54 @@ if __name__ == '__main__':
         speak("Start teleoperation")
         arm_ctrl.speed_gradual_max()
         _b_button_held = False
+        _vr_connected = True
+        _VR_STALE_THRESHOLD = 2.0
+        _tracking_paused = False
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
+
+            # --- VR connection monitoring ---
+            _evt_time = tv_wrapper.last_event_time
+            _vr_fresh = (_evt_time > 0) and (time.time() - _evt_time < _VR_STALE_THRESHOLD)
+            if _vr_connected and not _vr_fresh:
+                _vr_connected = False
+                _tracking_paused = True
+                if args.motion and args.input_mode == "controller":
+                    loco_wrapper.Move(0, 0, 0)
+                logger_mp.warning("[VR] Connection lost — tracking paused")
+                speak("VR disconnected. Tracking paused.")
+            elif not _vr_connected and _vr_fresh:
+                _vr_connected = True
+                arm_ctrl.speed_gradual_max()
+                logger_mp.info("[VR] Connection restored — press X to resume")
+                speak("VR reconnected. Press X to resume.")
+
+            if _tracking_paused:
+                if args.input_mode == "controller" and hasattr(tv_wrapper, 'tvuer'):
+                    if tv_wrapper.tvuer.left_ctrl_aButton:
+                        if not _x_button_held:
+                            _x_button_held = True
+                            _tracking_paused = False
+                            logger_mp.info("[VR] Resumed tracking after reconnection")
+                            speak("Tracking resumed")
+                    else:
+                        _x_button_held = False
+                if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                    head_img = img_client.get_head_frame()
+                    if head_img is not None and head_img.bgr is not None:
+                        _frame = draw_vr_hud(head_img.bgr.copy(), False, False, _vr_connected, True)
+                        tv_wrapper.render_to_xr(_frame)
+                time.sleep(0.033)
+                continue
+
             # get image
             if camera_config['head_camera']['enable_zmq']:
                 if args.record or xr_need_local_img:
                     head_img = img_client.get_head_frame()
                 if xr_need_local_img and head_img is not None and head_img.bgr is not None:
-                    tv_wrapper.render_to_xr(head_img.bgr)
+                    _frame = draw_vr_hud(head_img.bgr.copy(), True, RECORD_RUNNING, _vr_connected, False)
+                    tv_wrapper.render_to_xr(_frame)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
