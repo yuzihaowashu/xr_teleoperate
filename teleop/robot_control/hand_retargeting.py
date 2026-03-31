@@ -10,14 +10,16 @@ class HandType(Enum):
     INSPIRE_HAND_Unit_Test = "../../assets/inspire_hand/inspire_hand.yml"
     UNITREE_DEX3 = "../assets/unitree_hand/unitree_dex3.yml"
     UNITREE_DEX3_Unit_Test = "../../assets/unitree_hand/unitree_dex3.yml"
+    UNITREE_DEX3_VECTOR = "../assets/unitree_hand/unitree_dex3_vector.yml"
+    UNITREE_DEX3_VECTOR_Unit_Test = "../../assets/unitree_hand/unitree_dex3_vector.yml"
     BRAINCO_HAND = "../assets/brainco_hand/brainco.yml"
     BRAINCO_HAND_Unit_Test = "../../assets/brainco_hand/brainco.yml"
 
 class HandRetargeting:
     def __init__(self, hand_type: HandType):
-        if hand_type == HandType.UNITREE_DEX3:
+        if hand_type == HandType.UNITREE_DEX3 or hand_type == HandType.UNITREE_DEX3_VECTOR:
             RetargetingConfig.set_default_urdf_dir('../assets')
-        elif hand_type == HandType.UNITREE_DEX3_Unit_Test:
+        elif hand_type == HandType.UNITREE_DEX3_Unit_Test or hand_type == HandType.UNITREE_DEX3_VECTOR_Unit_Test:
             RetargetingConfig.set_default_urdf_dir('../../assets')
         elif hand_type == HandType.INSPIRE_HAND:
             RetargetingConfig.set_default_urdf_dir('../assets')
@@ -47,7 +49,8 @@ class HandRetargeting:
             self.left_indices = self.left_retargeting.optimizer.target_link_human_indices
             self.right_indices = self.right_retargeting.optimizer.target_link_human_indices
 
-            if hand_type == HandType.UNITREE_DEX3 or hand_type == HandType.UNITREE_DEX3_Unit_Test:
+            if hand_type in (HandType.UNITREE_DEX3, HandType.UNITREE_DEX3_Unit_Test,
+                             HandType.UNITREE_DEX3_VECTOR, HandType.UNITREE_DEX3_VECTOR_Unit_Test):
                 # In section "Sort by message structure" of https://support.unitree.com/home/en/G1_developer/dexterous_hand
                 self.left_dex3_api_joint_names  = [ 'left_hand_thumb_0_joint', 'left_hand_thumb_1_joint', 'left_hand_thumb_2_joint',
                                                     'left_hand_middle_0_joint', 'left_hand_middle_1_joint', 

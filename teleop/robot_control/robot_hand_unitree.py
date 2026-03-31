@@ -38,7 +38,7 @@ DEX3_RIGHT_CLOSE_Q = np.array([ 0.0, -1.0, -1.74,  1.57,  1.74,  1.57,  1.74])
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
                        dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False,
-                       left_trigger_value = None, right_trigger_value = None):
+                       left_trigger_value = None, right_trigger_value = None, retarget_type = "dexpilot"):
         """
         [note] A *_array type parameter requires using a multiprocessing Array, because it needs to be passed to the internal child process
 
@@ -57,16 +57,22 @@ class Dex3_1_Controller:
         Unit_Test: Whether to enable unit testing
 
         simulation_mode: Whether to use simulation mode (default is False, which means using real robot)
+
+        retarget_type: "dexpilot" (default, unchanged) or "vector" (Psi0-style fingertip retargeting)
         """
         logger_mp.info("Initialize Dex3_1_Controller...")
 
         self.fps = fps
         self.Unit_Test = Unit_Test
         self.simulation_mode = simulation_mode
-        if not self.Unit_Test:
-            self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3)
+        self.retarget_type = retarget_type
+
+        if retarget_type == "vector":
+            hand_type = HandType.UNITREE_DEX3_VECTOR if not Unit_Test else HandType.UNITREE_DEX3_VECTOR_Unit_Test
         else:
-            self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3_Unit_Test)
+            hand_type = HandType.UNITREE_DEX3 if not Unit_Test else HandType.UNITREE_DEX3_Unit_Test
+        self.hand_retargeting = HandRetargeting(hand_type)
+        logger_mp.info(f"[Dex3_1_Controller] retarget_type={retarget_type}, hand_type={hand_type.name}")
 
         # Publishers (created before fork, inherited by control_process)
         self.left_pub = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
@@ -171,11 +177,21 @@ class Dex3_1_Controller:
                         print(f"[Hand DBG]   R cmd  ={r_cmd.tolist()}", flush=True)
                         print(f"[Hand DBG]   R state={r_state.tolist()}  err={r_err.tolist()}", flush=True)
                 elif not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])):
-                    ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
-                    ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
-
-                    left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
-                    right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                    if self.retarget_type == "vector":
+                        _UNITREE_TIP = [4, 9, 14]  # thumb, index, middle in OpenXR
+                        ref_left_value = left_hand_data[_UNITREE_TIP].copy()
+                        ref_right_value = right_hand_data[_UNITREE_TIP].copy()
+                        ref_left_value[0]  *= 1.15;  ref_right_value[0] *= 1.15   # thumb
+                        ref_left_value[1]  *= 1.05;  ref_right_value[1] *= 1.05   # index
+                        ref_left_value[2]  *= 0.95;  ref_right_value[2] *= 0.95   # middle
+                        left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                        right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                    else:
+                        # DexPilot: 6-pair difference vectors (original, unchanged)
+                        ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
+                        ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
+                        left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
+                        right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
 
                 action_data = np.concatenate((left_q_target, right_q_target))
                 if dual_hand_state_array_out and dual_hand_action_array_out:

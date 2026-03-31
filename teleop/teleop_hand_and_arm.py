@@ -158,6 +158,7 @@ if __name__ == '__main__':
     parser.add_argument('--display-mode', type=str, choices=['immersive', 'ego', 'pass-through'], default='immersive', help='Select XR device display mode')
     parser.add_argument('--arm', type=str, choices=['G1_29', 'G1_23', 'H1_2', 'H1'], default='G1_29', help='Select arm controller')
     parser.add_argument('--ee', type=str, choices=['dex1', 'dex3', 'inspire_ftp', 'inspire_dfx', 'brainco'], help='Select end effector controller')
+    parser.add_argument('--retarget-type', type=str, choices=['dexpilot', 'vector'], default='dexpilot', help='Hand retargeting algorithm for dex3 hand tracking mode (dexpilot=default, vector=Psi0-style)')
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
@@ -249,7 +250,8 @@ if __name__ == '__main__':
             right_trigger_value = Value('d', 0.0) if args.input_mode == "controller" else None
             hand_ctrl = Dex3_1_Controller(left_hand_pos_array, right_hand_pos_array, dual_hand_data_lock, 
                                           dual_hand_state_array, dual_hand_action_array, simulation_mode=args.sim,
-                                          left_trigger_value=left_trigger_value, right_trigger_value=right_trigger_value)
+                                          left_trigger_value=left_trigger_value, right_trigger_value=right_trigger_value,
+                                          retarget_type=args.retarget_type)
         elif args.ee == "dex1":
             from teleop.robot_control.robot_hand_unitree import Dex1_1_Gripper_Controller
             left_gripper_value = Value('d', 0.0, lock=True)        # [input]
