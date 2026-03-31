@@ -32,8 +32,8 @@ kTopicDex3RightState = "rt/dex3/right/state"
 
 
 DEX3_OPEN_Q  = np.zeros(Dex3_Num_Motors)
-DEX3_LEFT_CLOSE_Q  = np.array([ 0.8,  0.8,  1.2, -1.2, -1.4, -1.2, -1.4])
-DEX3_RIGHT_CLOSE_Q = np.array([-0.8, -0.8, -1.2,  1.2,  1.4,  1.2,  1.4])
+DEX3_LEFT_CLOSE_Q  = np.array([ 0.0,  1.0,  1.74, -1.57, -1.74, -1.57, -1.74])
+DEX3_RIGHT_CLOSE_Q = np.array([ 0.0, -1.0, -1.74,  1.57,  1.74,  1.57,  1.74])
 
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
@@ -157,12 +157,19 @@ class Dex3_1_Controller:
                     left_q_target  = DEX3_OPEN_Q * (1.0 - lt) + DEX3_LEFT_CLOSE_Q * lt
                     right_q_target = DEX3_OPEN_Q * (1.0 - rt) + DEX3_RIGHT_CLOSE_Q * rt
                     _now = time.time()
-                    if _now - _last_dbg > 2.0:
+                    if _now - _last_dbg > 0.5:
                         _last_dbg = _now
-                        l_state = np.round(state_data[:7], 3).tolist()
-                        r_state = np.round(state_data[7:], 3).tolist()
-                        print(f"[Hand DBG] lt={lt:.3f} rt={rt:.3f} | L_cmd={np.round(left_q_target,2).tolist()} R_cmd={np.round(right_q_target,2).tolist()}", flush=True)
-                        print(f"[Hand DBG]   L_state={l_state} R_state={r_state}", flush=True)
+                        l_cmd = np.round(left_q_target, 3)
+                        r_cmd = np.round(right_q_target, 3)
+                        l_state = np.round(state_data[:7], 3)
+                        r_state = np.round(state_data[7:], 3)
+                        l_err = np.round(l_cmd - l_state, 3)
+                        r_err = np.round(r_cmd - r_state, 3)
+                        print(f"[Hand DBG] lt={lt:.3f} rt={rt:.3f}", flush=True)
+                        print(f"[Hand DBG]   L cmd  ={l_cmd.tolist()}", flush=True)
+                        print(f"[Hand DBG]   L state={l_state.tolist()}  err={l_err.tolist()}", flush=True)
+                        print(f"[Hand DBG]   R cmd  ={r_cmd.tolist()}", flush=True)
+                        print(f"[Hand DBG]   R state={r_state.tolist()}  err={r_err.tolist()}", flush=True)
                 elif not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])):
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
