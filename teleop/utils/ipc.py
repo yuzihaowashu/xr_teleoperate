@@ -64,6 +64,7 @@ class IPC_Server:
         "CMD_START": "r",          # launch
         "CMD_STOP": "q",           # exit
         "CMD_RECORD_TOGGLE": "s",  # start & stop (toggle record)
+        "CMD_LOCO_TOGGLE": "m",    # toggle locomotion on/off
     }
 
     def __init__(self, on_press=None, get_state=None, hb_fps=10.0):
@@ -199,7 +200,7 @@ class IPC_Client:
     """
     def __init__(self, hb_fps=10.0):
         """hb_fps: heartbeat subscribe frequency, should match server side."""
-        self.ctx = zmq.Context.instance()
+        self.ctx = zmq.Context()  # dedicated context so stop() won't break the global singleton
 
         # heartbeat IPC (PUB/SUB)
         self._hb_running = True

@@ -32,7 +32,8 @@ kTopicDex3RightState = "rt/dex3/right/state"
 
 
 DEX3_OPEN_Q  = np.zeros(Dex3_Num_Motors)
-DEX3_CLOSE_Q = np.array([0.8, 0.8, 1.2, -1.2, -1.4, -1.2, -1.4])
+DEX3_LEFT_CLOSE_Q  = np.array([ 0.8,  0.8,  1.2, -1.2, -1.4, -1.2, -1.4])
+DEX3_RIGHT_CLOSE_Q = np.array([-0.8, -0.8, -1.2,  1.2,  1.4,  1.2,  1.4])
 
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
@@ -67,11 +68,11 @@ class Dex3_1_Controller:
         else:
             self.hand_retargeting = HandRetargeting(HandType.UNITREE_DEX3_Unit_Test)
 
-        # initialize handcmd publisher and handstate subscriber
-        self.LeftHandCmb_publisher = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
-        self.LeftHandCmb_publisher.Init()
-        self.RightHandCmb_publisher = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
-        self.RightHandCmb_publisher.Init()
+        # Publishers (created before fork, inherited by control_process)
+        self.left_pub = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
+        self.left_pub.Init()
+        self.right_pub = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
+        self.right_pub.Init()
 
         self.LeftHandState_subscriber = ChannelSubscriber(kTopicDex3LeftState, HandState_)
         self.LeftHandState_subscriber.Init()
@@ -94,11 +95,15 @@ class Dex3_1_Controller:
             logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
-        hand_control_process = Process(target=self.control_process, args=(left_hand_array_in, right_hand_array_in,  self.left_hand_state_array, self.right_hand_state_array,
-                                                                          dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
-                                                                          left_trigger_value, right_trigger_value))
-        hand_control_process.daemon = True
-        hand_control_process.start()
+        hand_control_thread = threading.Thread(
+            target=self.control_process,
+            args=(left_hand_array_in, right_hand_array_in,
+                  self.left_hand_state_array, self.right_hand_state_array,
+                  dual_hand_data_lock, dual_hand_state_array_out, dual_hand_action_array_out,
+                  left_trigger_value, right_trigger_value),
+            daemon=True,
+        )
+        hand_control_thread.start()
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
 
@@ -115,102 +120,83 @@ class Dex3_1_Controller:
                     self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
             time.sleep(0.002)
     
-    class _RIS_Mode:
-        def __init__(self, id=0, status=0x01, timeout=0):
-            self.motor_mode = 0
-            self.id = id & 0x0F  # 4 bits for id
-            self.status = status & 0x07  # 3 bits for status
-            self.timeout = timeout & 0x01  # 1 bit for timeout
+    @staticmethod
+    def _make_hand_mode(motor_id, status=0x01, timeout=0):
+        """Build mode byte (same as TWIST2 teleop_bridge)."""
+        return (motor_id & 0x0F) | ((status & 0x07) << 4) | ((timeout & 0x01) << 7)
 
-        def _mode_to_uint8(self):
-            self.motor_mode |= (self.id & 0x0F)
-            self.motor_mode |= (self.status & 0x07) << 4
-            self.motor_mode |= (self.timeout & 0x01) << 7
-            return self.motor_mode
-
-    def ctrl_dual_hand(self, left_q_target, right_q_target):
-        """set current left, right hand motor state target q"""
-        for idx, id in enumerate(Dex3_1_Left_JointIndex):
-            self.left_msg.motor_cmd[id].q = left_q_target[idx]
-        for idx, id in enumerate(Dex3_1_Right_JointIndex):
-            self.right_msg.motor_cmd[id].q = right_q_target[idx]
-
-        self.LeftHandCmb_publisher.Write(self.left_msg)
-        self.RightHandCmb_publisher.Write(self.right_msg)
-        # logger_mp.debug("hand ctrl publish ok.")
-    
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None,
                               left_trigger_value = None, right_trigger_value = None):
         self.running = True
 
-        left_q_target  = np.full(Dex3_Num_Motors, 0)
-        right_q_target = np.full(Dex3_Num_Motors, 0)
+        left_q_target  = np.full(Dex3_Num_Motors, 0.0)
+        right_q_target = np.full(Dex3_Num_Motors, 0.0)
 
-        q = 0.0
-        dq = 0.0
-        tau = 0.0
-        kp = 1.5
-        kd = 0.2
+        kp = 1.0
+        kd = 0.3
 
-        # initialize dex3-1's left hand cmd msg
-        self.left_msg  = unitree_hg_msg_dds__HandCmd_()
-        for id in Dex3_1_Left_JointIndex:
-            ris_mode = self._RIS_Mode(id = id, status = 0x01)
-            motor_mode = ris_mode._mode_to_uint8()
-            self.left_msg.motor_cmd[id].mode = motor_mode
-            self.left_msg.motor_cmd[id].q    = q
-            self.left_msg.motor_cmd[id].dq   = dq
-            self.left_msg.motor_cmd[id].tau  = tau
-            self.left_msg.motor_cmd[id].kp   = kp
-            self.left_msg.motor_cmd[id].kd   = kd
-
-        # initialize dex3-1's right hand cmd msg
-        self.right_msg = unitree_hg_msg_dds__HandCmd_()
-        for id in Dex3_1_Right_JointIndex:
-            ris_mode = self._RIS_Mode(id = id, status = 0x01)
-            motor_mode = ris_mode._mode_to_uint8()
-            self.right_msg.motor_cmd[id].mode = motor_mode  
-            self.right_msg.motor_cmd[id].q    = q
-            self.right_msg.motor_cmd[id].dq   = dq
-            self.right_msg.motor_cmd[id].tau  = tau
-            self.right_msg.motor_cmd[id].kp   = kp
-            self.right_msg.motor_cmd[id].kd   = kd  
+        _mode_lut = [self._make_hand_mode(i) for i in range(Dex3_Num_Motors)]
+        _last_dbg = 0.0
 
         try:
             while self.running:
                 start_time = time.time()
-                # get dual hand state
                 with left_hand_array_in.get_lock():
                     left_hand_data  = np.array(left_hand_array_in[:]).reshape(25, 3).copy()
                 with right_hand_array_in.get_lock():
                     right_hand_data = np.array(right_hand_array_in[:]).reshape(25, 3).copy()
 
-                # Read left and right q_state from shared arrays
                 state_data = np.concatenate((np.array(left_hand_state_array[:]), np.array(right_hand_state_array[:])))
 
                 if left_trigger_value is not None and right_trigger_value is not None:
-                    lt = np.clip(left_trigger_value.value, 0.0, 1.0)
-                    rt = np.clip(right_trigger_value.value, 0.0, 1.0)
-                    left_q_target  = DEX3_OPEN_Q * (1.0 - lt) + DEX3_CLOSE_Q * lt
-                    right_q_target = DEX3_OPEN_Q * (1.0 - rt) + DEX3_CLOSE_Q * rt
-                elif not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])): # if hand data has been initialized.
+                    lt_raw = left_trigger_value.value
+                    rt_raw = right_trigger_value.value
+                    lt = np.clip(lt_raw, 0.0, 1.0)
+                    rt = np.clip(rt_raw, 0.0, 1.0)
+                    left_q_target  = DEX3_OPEN_Q * (1.0 - lt) + DEX3_LEFT_CLOSE_Q * lt
+                    right_q_target = DEX3_OPEN_Q * (1.0 - rt) + DEX3_RIGHT_CLOSE_Q * rt
+                    _now = time.time()
+                    if _now - _last_dbg > 2.0:
+                        _last_dbg = _now
+                        l_state = np.round(state_data[:7], 3).tolist()
+                        r_state = np.round(state_data[7:], 3).tolist()
+                        print(f"[Hand DBG] lt={lt:.3f} rt={rt:.3f} | L_cmd={np.round(left_q_target,2).tolist()} R_cmd={np.round(right_q_target,2).tolist()}", flush=True)
+                        print(f"[Hand DBG]   L_state={l_state} R_state={r_state}", flush=True)
+                elif not np.all(right_hand_data == 0.0) and not np.all(left_hand_data[4] == np.array([-1.13, 0.3, 0.15])):
                     ref_left_value = left_hand_data[self.hand_retargeting.left_indices[1,:]] - left_hand_data[self.hand_retargeting.left_indices[0,:]]
                     ref_right_value = right_hand_data[self.hand_retargeting.right_indices[1,:]] - right_hand_data[self.hand_retargeting.right_indices[0,:]]
 
                     left_q_target  = self.hand_retargeting.left_retargeting.retarget(ref_left_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
                     right_q_target = self.hand_retargeting.right_retargeting.retarget(ref_right_value)[self.hand_retargeting.right_dex_retargeting_to_hardware]
 
-                # get dual hand action
-                action_data = np.concatenate((left_q_target, right_q_target))    
+                action_data = np.concatenate((left_q_target, right_q_target))
                 if dual_hand_state_array_out and dual_hand_action_array_out:
                     with dual_hand_data_lock:
                         dual_hand_state_array_out[:] = state_data
                         dual_hand_action_array_out[:] = action_data
 
-                self.ctrl_dual_hand(left_q_target, right_q_target)
-                current_time = time.time()
-                time_elapsed = current_time - start_time
+                cmd_left = unitree_hg_msg_dds__HandCmd_()
+                cmd_right = unitree_hg_msg_dds__HandCmd_()
+                for i in range(Dex3_Num_Motors):
+                    cmd_left.motor_cmd[i].mode = _mode_lut[i]
+                    cmd_left.motor_cmd[i].q    = float(left_q_target[i])
+                    cmd_left.motor_cmd[i].dq   = 0.0
+                    cmd_left.motor_cmd[i].tau  = 0.0
+                    cmd_left.motor_cmd[i].kp   = kp
+                    cmd_left.motor_cmd[i].kd   = kd
+
+                    cmd_right.motor_cmd[i].mode = _mode_lut[i]
+                    cmd_right.motor_cmd[i].q    = float(right_q_target[i])
+                    cmd_right.motor_cmd[i].dq   = 0.0
+                    cmd_right.motor_cmd[i].tau  = 0.0
+                    cmd_right.motor_cmd[i].kp   = kp
+                    cmd_right.motor_cmd[i].kd   = kd
+
+                self.left_pub.Write(cmd_left)
+                self.right_pub.Write(cmd_right)
+
+                time_elapsed = time.time() - start_time
                 sleep_time = max(0, (1 / self.fps) - time_elapsed)
                 time.sleep(sleep_time)
         finally:

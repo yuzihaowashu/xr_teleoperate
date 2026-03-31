@@ -18,6 +18,53 @@ kTopicLowCommand_Debug  = "rt/lowcmd"
 kTopicLowCommand_Motion = "rt/arm_sdk"
 kTopicLowState = "rt/lowstate"
 
+# ─── Gravity Compensation (Pinocchio) ─────────────────────────────────────
+_GRAV_URDF_PATH = (
+    "/home/humanoid-pc/unitree_rl_gym/resources/robots/"
+    "g1_description/g1_29dof_with_hand_rev_1_0.urdf"
+)
+_UNITREE_TO_PIN = {}
+for _i in range(15):
+    _UNITREE_TO_PIN[_i] = _i
+for _i in range(7):
+    _UNITREE_TO_PIN[15 + _i] = 15 + _i
+    _UNITREE_TO_PIN[22 + _i] = 29 + _i
+
+_WAIST_JOINTS = [12, 13, 14]
+_ARM_JOINTS = list(range(15, 29))
+
+
+class GravityCompensator:
+    """Compute per-joint gravity torques using Pinocchio (full model)."""
+
+    def __init__(self):
+        self.available = False
+        try:
+            import pinocchio as pin
+            self.pin = pin
+            self.model = pin.buildModelFromUrdf(_GRAV_URDF_PATH)
+            self.data = self.model.createData()
+            self.neutral_q = pin.neutral(self.model)
+            self.available = True
+            logger_mp.info("Gravity compensation: ENABLED (Pinocchio + URDF)")
+        except Exception as e:
+            logger_mp.warning(f"Gravity compensation: DISABLED ({e})")
+
+    def compute(self, motor_q_func):
+        """Return {unitree_joint_idx: tau_ff} for waist + arm joints."""
+        if not self.available:
+            return {}
+        q = self.neutral_q.copy()
+        for u_idx, p_idx in _UNITREE_TO_PIN.items():
+            if p_idx < self.model.nq:
+                q[p_idx] = motor_q_func(u_idx)
+        G = self.pin.computeGeneralizedGravity(self.model, self.data, q)
+        tau_ff = {}
+        for j in _WAIST_JOINTS + _ARM_JOINTS:
+            p_idx = _UNITREE_TO_PIN[j]
+            tau_ff[j] = float(G[p_idx])
+        return tau_ff
+
 G1_29_Num_Motors = 35
 G1_23_Num_Motors = 35
 H1_2_Num_Motors = 35
@@ -59,9 +106,15 @@ class DataBuffer:
             self.data = data
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False):
+    def __init__(self, motion_mode = False, simulation_mode = False, safe_deploy = True):
         logger_mp.info("Initialize G1_29_ArmController...")
-        self.q_target = np.zeros(14)
+        if safe_deploy:
+            _spread_q = np.zeros(14)
+            _spread_q[1] = 1.5    # left shoulder roll → outward
+            _spread_q[8] = -1.5   # right shoulder roll → outward
+            self.q_target = _spread_q.copy()
+        else:
+            self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
@@ -71,6 +124,10 @@ class G1_29_ArmController:
         self.kd_low = 3.0
         self.kp_wrist = 40.0
         self.kd_wrist = 1.5
+        self.kp_waist = 200.0
+        self.kd_waist = 5.0
+
+        self.grav_comp = GravityCompensator()
 
         self.all_motor_q = None
         self.arm_velocity_limit = 20.0
@@ -111,6 +168,7 @@ class G1_29_ArmController:
         logger_mp.info("Lock all joints except two arms...")
 
         arm_indices = set(member.value for member in G1_29_JointArmIndex)
+        waist_indices = set(_WAIST_JOINTS)
         for id in G1_29_JointIndex:
             self.msg.motor_cmd[id].mode = 1
             if id.value in arm_indices:
@@ -120,6 +178,9 @@ class G1_29_ArmController:
                 else:
                     self.msg.motor_cmd[id].kp = self.kp_low
                     self.msg.motor_cmd[id].kd = self.kd_low
+            elif id.value in waist_indices:
+                self.msg.motor_cmd[id].kp = self.kp_waist
+                self.msg.motor_cmd[id].kd = self.kd_waist
             else:
                 if self._Is_weak_motor(id):
                     self.msg.motor_cmd[id].kp = self.kp_low
@@ -128,13 +189,25 @@ class G1_29_ArmController:
                     self.msg.motor_cmd[id].kp = self.kp_high
                     self.msg.motor_cmd[id].kd = self.kd_high
             self.msg.motor_cmd[id].q  = self.all_motor_q[id]
-        logger_mp.info("Lock OK!")
+
+        for j in _WAIST_JOINTS:
+            self.msg.motor_cmd[j].q = 0.0
+        logger_mp.info(f"Lock OK! (waist kp={self.kp_waist}, kd={self.kd_waist}, q=0.0)")
 
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
         self.publish_thread.daemon = True
         self.publish_thread.start()
+
+        if safe_deploy:
+            logger_mp.info("[safe_arm_deploy] Phase 1: arms spreading outward...")
+            time.sleep(1.0)
+            logger_mp.info("[safe_arm_deploy] Phase 2: moving to home q=0...")
+            with self.ctrl_lock:
+                self.q_target = np.zeros(14)
+            time.sleep(1.0)
+            logger_mp.info("[safe_arm_deploy] Done.")
 
         logger_mp.info("Initialize G1_29_ArmController OK!")
 
@@ -172,10 +245,21 @@ class G1_29_ArmController:
             else:
                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
+            grav = {}
+            if self.grav_comp.available:
+                low_data = self.lowstate_buffer.GetData()
+                if low_data is not None:
+                    grav = self.grav_comp.compute(
+                        lambda u_idx: low_data.motor_state[u_idx].q
+                    )
+
             for idx, id in enumerate(G1_29_JointArmIndex):
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
-                self.msg.motor_cmd[id].tau = arm_tauff_target[idx]   
+                self.msg.motor_cmd[id].tau = 0.0
+
+            for j in _WAIST_JOINTS:
+                self.msg.motor_cmd[j].tau = grav.get(j, 0.0)
 
             self.msg.crc = self.crc.Crc(self.msg)
             self.lowcmd_publisher.Write(self.msg)
@@ -214,25 +298,59 @@ class G1_29_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Move both the left and right arms of the robot to their home position by setting the target joint angles (q) and torques (tau) to zero.'''
+        '''Spread arms outward → move to home (q=0) → slowly ramp down.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
-        max_attempts = 100
-        current_attempts = 0
+
+        # Phase 1: spread outward to clear body
+        spread_q = np.zeros(14)
+        spread_q[1] = 1.5
+        spread_q[8] = -1.5
+        with self.ctrl_lock:
+            self.q_target = spread_q.copy()
+        logger_mp.info("[G1_29_ArmController] go_home: spreading outward...")
+        time.sleep(1.0)
+
+        # Phase 2: move to home (q=0)
         with self.ctrl_lock:
             self.q_target = np.zeros(14)
-            # self.tauff_target = np.zeros(14)
-        tolerance = 0.05  # Tolerance threshold for joint angles to determine "close to zero", can be adjusted based on your motor's precision requirements
-        while current_attempts < max_attempts:
+        logger_mp.info("[G1_29_ArmController] go_home: moving to q=0...")
+        for _ in range(40):
             current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < tolerance):
-                if self.motion_mode:
-                    for weight in np.linspace(1, 0, num=101):
-                        self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight;
-                        time.sleep(0.02)
-                logger_mp.info("[G1_29_ArmController] both arms have reached the home position.")
+            if np.all(np.abs(current_q) < 0.1):
                 break
-            current_attempts += 1
             time.sleep(0.05)
+
+        # Phase 3: slowly ramp down arm_sdk weight
+        if self.motion_mode:
+            logger_mp.info("[G1_29_ArmController] go_home: ramping down slowly...")
+            for weight in np.linspace(1, 0, num=201):
+                self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
+                time.sleep(0.02)
+            logger_mp.info("[G1_29_ArmController] arm_sdk weight = 0, control released.")
+
+    def safe_arm_deploy(self, spread_time=2.0, home_time=2.0):
+        """Move arms outward first (avoid body collision), then to home (q=0).
+
+        Phase 1 – spread: shoulder roll opens outward while pitch stays ~0
+        and elbows stay straight.  This clears the torso.
+        Phase 2 – home: all joints → 0 (standard teleop start pose).
+        """
+        # 14-element arm array index mapping:
+        #  [1] L_ShoulderRoll  [8] R_ShoulderRoll
+        spread_q = np.zeros(14)
+        spread_q[1] = 1.5    # left shoulder roll → outward
+        spread_q[8] = -1.5   # right shoulder roll → outward (mirrored)
+
+        logger_mp.info("[safe_arm_deploy] Phase 1: spreading arms outward...")
+        with self.ctrl_lock:
+            self.q_target = spread_q.copy()
+        time.sleep(spread_time)
+
+        logger_mp.info("[safe_arm_deploy] Phase 2: moving to home (q=0)...")
+        with self.ctrl_lock:
+            self.q_target = np.zeros(14)
+        time.sleep(home_time)
+        logger_mp.info("[safe_arm_deploy] Done — arms at home position.")
 
     def speed_gradual_max(self, t = 5.0):
         '''Parameter t is the total time required for arms velocity to gradually increase to its maximum value, in seconds. The default is 5.0.'''
