@@ -552,6 +552,17 @@ if __name__ == '__main__':
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
+
+            # Monitor wrist joints: indices 4=L_WristRoll, 5=L_WristPitch, 6=L_WristYaw,
+            #                                11=R_WristRoll, 12=R_WristPitch, 13=R_WristYaw
+            if not hasattr(arm_ik, '_dbg_t') or (time_ik_end - arm_ik._dbg_t) > 1.0:
+                arm_ik._dbg_t = time_ik_end
+                import numpy as _np
+                _wrist_idx = [4, 5, 6, 11, 12, 13]
+                _wrist_names = ['LWR','LWP','LWY','RWR','RWP','RWY']
+                _vals = ' '.join(f'{_wrist_names[i]}={sol_q[_wrist_idx[i]]:.3f}' for i in range(6))
+                logger_mp.info(f"[IK_DBG] {_vals}")
+
             arm_ctrl.ctrl_dual_arm(sol_q, sol_tauff)
 
             # record data

@@ -35,6 +35,35 @@ DEX3_OPEN_Q  = np.zeros(Dex3_Num_Motors)
 DEX3_LEFT_CLOSE_Q  = np.array([ 0.0,  1.0,  1.74, -1.57, -1.74, -1.57, -1.74])
 DEX3_RIGHT_CLOSE_Q = np.array([ 0.0, -1.0, -1.74,  1.57,  1.74,  1.57,  1.74])
 
+
+def dex3_open_hands(duration: float = 1.0, kp: float = 1.0, kd: float = 0.3):
+    """Send OPEN (q=0) commands to both Dex3-1 hands for `duration` seconds.
+    Safe to call from any thread; creates its own publishers."""
+    left_pub = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
+    left_pub.Init()
+    right_pub = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
+    right_pub.Init()
+
+    def _mode(motor_id):
+        return (motor_id & 0x0F) | ((0x01 & 0x07) << 4)
+
+    t_end = time.time() + duration
+    while time.time() < t_end:
+        cmd_left = unitree_hg_msg_dds__HandCmd_()
+        cmd_right = unitree_hg_msg_dds__HandCmd_()
+        for i in range(Dex3_Num_Motors):
+            for cmd in (cmd_left, cmd_right):
+                cmd.motor_cmd[i].mode = _mode(i)
+                cmd.motor_cmd[i].q = 0.0
+                cmd.motor_cmd[i].dq = 0.0
+                cmd.motor_cmd[i].tau = 0.0
+                cmd.motor_cmd[i].kp = kp
+                cmd.motor_cmd[i].kd = kd
+        left_pub.Write(cmd_left)
+        right_pub.Write(cmd_right)
+        time.sleep(0.01)
+    logger_mp.info(f"[dex3_open_hands] Sent OPEN for {duration:.1f}s")
+
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
                        dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False,

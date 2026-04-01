@@ -14,6 +14,14 @@ from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
 import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
+def _try_open_hands(duration: float = 1.0):
+    """Best-effort: open Dex3-1 hands. Silently skip if hand module unavailable."""
+    try:
+        from teleop.robot_control.robot_hand_unitree import dex3_open_hands
+        dex3_open_hands(duration=duration)
+    except Exception as e:
+        logger_mp.debug(f"[_try_open_hands] skipped: {e}")
+
 kTopicLowCommand_Debug  = "rt/lowcmd"
 kTopicLowCommand_Motion = "rt/arm_sdk"
 kTopicLowState = "rt/lowstate"
@@ -71,10 +79,15 @@ H1_2_Num_Motors = 35
 H1_Num_Motors = 20
  
 
+_MOTOR_TEMP_WARN = 70
+_MOTOR_TEMP_DISABLE = 85
+
 class MotorState:
     def __init__(self):
         self.q = None
         self.dq = None
+        self.temperature = (0, 0)
+        self.mode = 1
 
 class G1_29_LowState:
     def __init__(self):
@@ -104,6 +117,15 @@ class DataBuffer:
     def SetData(self, data):
         with self.lock:
             self.data = data
+
+_G1_29_ARM_Q_LOWER = np.array([
+    -3.089, -1.588, -2.618, -1.047, -1.972, -1.614, -1.614,  # left arm
+    -3.089, -2.252, -2.618, -1.047, -1.972, -1.614, -1.614,  # right arm
+])
+_G1_29_ARM_Q_UPPER = np.array([
+     2.670,  2.252,  2.618,  2.094,  1.972,  1.614,  1.614,  # left arm
+     2.670,  1.588,  2.618,  2.094,  1.972,  1.614,  1.614,  # right arm
+])
 
 class G1_29_ArmController:
     def __init__(self, motion_mode = False, simulation_mode = False, safe_deploy = True):
@@ -201,6 +223,8 @@ class G1_29_ArmController:
         self.publish_thread.start()
 
         if safe_deploy:
+            logger_mp.info("[safe_arm_deploy] Phase 0: opening hands...")
+            _try_open_hands(duration=0.5)
             logger_mp.info("[safe_arm_deploy] Phase 1: arms spreading outward...")
             time.sleep(1.0)
             logger_mp.info("[safe_arm_deploy] Phase 2: moving to home q=0...")
@@ -219,6 +243,8 @@ class G1_29_ArmController:
                 for id in range(G1_29_Num_Motors):
                     lowstate.motor_state[id].q  = msg.motor_state[id].q
                     lowstate.motor_state[id].dq = msg.motor_state[id].dq
+                    lowstate.motor_state[id].temperature = tuple(msg.motor_state[id].temperature)
+                    lowstate.motor_state[id].mode = msg.motor_state[id].mode
                 self.lowstate_buffer.SetData(lowstate)
             time.sleep(0.002)
 
@@ -227,11 +253,15 @@ class G1_29_ArmController:
         delta = target_q - current_q
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
+        cliped_arm_q_target = np.clip(cliped_arm_q_target, _G1_29_ARM_Q_LOWER, _G1_29_ARM_Q_UPPER)
         return cliped_arm_q_target
 
     def _ctrl_motor_state(self):
         if self.motion_mode:
             self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = 1.0;
+
+        disabled_motors = set()
+        _last_temp_log = 0.0
 
         while True:
             start_time = time.time()
@@ -246,14 +276,41 @@ class G1_29_ArmController:
                 cliped_arm_q_target = self.clip_arm_q_target(arm_q_target, velocity_limit = self.arm_velocity_limit)
 
             grav = {}
-            if self.grav_comp.available:
-                low_data = self.lowstate_buffer.GetData()
-                if low_data is not None:
-                    grav = self.grav_comp.compute(
-                        lambda u_idx: low_data.motor_state[u_idx].q
-                    )
+            low_data = self.lowstate_buffer.GetData()
+            if self.grav_comp.available and low_data is not None:
+                grav = self.grav_comp.compute(
+                    lambda u_idx: low_data.motor_state[u_idx].q
+                )
+
+            # Temperature safety check (every 2 seconds)
+            if low_data is not None and (start_time - _last_temp_log) > 2.0:
+                _last_temp_log = start_time
+                for idx, id in enumerate(G1_29_JointArmIndex):
+                    ms = low_data.motor_state[id]
+                    max_temp = max(ms.temperature) if ms.temperature else 0
+                    if max_temp >= _MOTOR_TEMP_DISABLE and id.value not in disabled_motors:
+                        disabled_motors.add(id.value)
+                        logger_mp.error(
+                            f"[SAFETY] Motor {id.name}({id.value}) DISABLED — "
+                            f"temp={list(ms.temperature)}, mode={ms.mode}. "
+                            f"Holding current q to prevent damage."
+                        )
+                    elif max_temp >= _MOTOR_TEMP_WARN and id.value not in disabled_motors:
+                        logger_mp.warning(
+                            f"[SAFETY] Motor {id.name}({id.value}) HOT — "
+                            f"temp={list(ms.temperature)}"
+                        )
+                    elif max_temp < _MOTOR_TEMP_WARN and id.value in disabled_motors:
+                        disabled_motors.discard(id.value)
+                        logger_mp.info(
+                            f"[SAFETY] Motor {id.name}({id.value}) cooled down — "
+                            f"temp={list(ms.temperature)}, re-enabled."
+                        )
 
             for idx, id in enumerate(G1_29_JointArmIndex):
+                if id.value in disabled_motors:
+                    if low_data is not None:
+                        cliped_arm_q_target[idx] = low_data.motor_state[id].q
                 self.msg.motor_cmd[id].q = cliped_arm_q_target[idx]
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = 0.0
@@ -272,8 +329,6 @@ class G1_29_ArmController:
             all_t_elapsed = current_time - start_time
             sleep_time = max(0, (self.control_dt - all_t_elapsed))
             time.sleep(sleep_time)
-            # logger_mp.debug(f"arm_velocity_limit:{self.arm_velocity_limit}")
-            # logger_mp.debug(f"sleep_time:{sleep_time}")
 
     def ctrl_dual_arm(self, q_target, tauff_target):
         '''Set control target values q & tau of the left and right arm motors.'''
@@ -298,8 +353,12 @@ class G1_29_ArmController:
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
     def ctrl_dual_arm_go_home(self):
-        '''Spread arms outward → move to home (q=0) → slowly ramp down.'''
+        '''Open hands → spread arms outward → move to home (q=0) → slowly ramp down.'''
         logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
+
+        # Phase 0: open hands first
+        logger_mp.info("[G1_29_ArmController] go_home: opening hands...")
+        _try_open_hands(duration=0.5)
 
         # Phase 1: spread outward to clear body
         spread_q = np.zeros(14)
