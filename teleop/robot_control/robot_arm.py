@@ -119,13 +119,24 @@ class DataBuffer:
             self.data = data
 
 _G1_29_ARM_Q_LOWER = np.array([
-    -3.089, -1.588, -2.618, -1.047, -1.972, -1.614, -1.614,  # left arm
-    -3.089, -2.252, -2.618, -1.047, -1.972, -1.614, -1.614,  # right arm
+    # left arm — shoulder/elbow at 85% URDF, wrist at 60% URDF
+    -2.626, -1.350, -2.225, -0.890, -1.183, -0.968, -0.968,
+    # right arm
+    -2.626, -1.914, -2.225, -0.890, -1.183, -0.968, -0.968,
 ])
 _G1_29_ARM_Q_UPPER = np.array([
-     2.670,  2.252,  2.618,  2.094,  1.972,  1.614,  1.614,  # left arm
-     2.670,  1.588,  2.618,  2.094,  1.972,  1.614,  1.614,  # right arm
+    # left arm
+     2.270,  1.914,  2.225,  1.780,  1.183,  0.968,  0.968,
+    # right arm
+     2.270,  1.350,  2.225,  1.780,  1.183,  0.968,  0.968,
 ])
+
+# Disabled arm joint indices (14-dim arm space). These joints are locked to 0.
+# Index map: 0=L_ShoulderPitch 1=L_ShoulderRoll 2=L_ShoulderYaw 3=L_Elbow
+#            4=L_WristRoll     5=L_WristPitch   6=L_WristYaw
+#            7=R_ShoulderPitch 8=R_ShoulderRoll 9=R_ShoulderYaw 10=R_Elbow
+#           11=R_WristRoll    12=R_WristPitch  13=R_WristYaw
+_G1_29_DISABLED_ARM_JOINTS = {5}  # L_WristPitch — hardware fault, lock to q=0
 
 class G1_29_ArmController:
     def __init__(self, motion_mode = False, simulation_mode = False, safe_deploy = True):
@@ -142,17 +153,17 @@ class G1_29_ArmController:
         self.simulation_mode = simulation_mode
         self.kp_high = 300.0
         self.kd_high = 3.0
-        self.kp_low = 80.0
-        self.kd_low = 3.0
-        self.kp_wrist = 40.0
-        self.kd_wrist = 1.5
+        self.kp_low = 150.0
+        self.kd_low = 3.5
+        self.kp_wrist = 60.0
+        self.kd_wrist = 2.0
         self.kp_waist = 200.0
         self.kd_waist = 5.0
 
         self.grav_comp = GravityCompensator()
 
         self.all_motor_q = None
-        self.arm_velocity_limit = 20.0
+        self.arm_velocity_limit = 25.0
         self.control_dt = 1.0 / 250.0
 
         self._speed_gradual_max = False
@@ -253,7 +264,22 @@ class G1_29_ArmController:
         delta = target_q - current_q
         motion_scale = np.max(np.abs(delta)) / (velocity_limit * self.control_dt)
         cliped_arm_q_target = current_q + delta / max(motion_scale, 1.0)
+
+        # Soft boundary damping: decelerate as joints approach limits
+        _SOFT_MARGIN = 0.15  # rad — damping zone width
+        for i in range(14):
+            dist_lo = cliped_arm_q_target[i] - _G1_29_ARM_Q_LOWER[i]
+            dist_hi = _G1_29_ARM_Q_UPPER[i] - cliped_arm_q_target[i]
+            nearest = min(dist_lo, dist_hi)
+            if nearest < _SOFT_MARGIN:
+                alpha = max(nearest, 0.0) / _SOFT_MARGIN
+                cliped_arm_q_target[i] = alpha * cliped_arm_q_target[i] + (1.0 - alpha) * current_q[i]
+
         cliped_arm_q_target = np.clip(cliped_arm_q_target, _G1_29_ARM_Q_LOWER, _G1_29_ARM_Q_UPPER)
+
+        for i in _G1_29_DISABLED_ARM_JOINTS:
+            cliped_arm_q_target[i] = 0.0
+
         return cliped_arm_q_target
 
     def _ctrl_motor_state(self):

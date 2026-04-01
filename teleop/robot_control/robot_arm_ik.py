@@ -149,12 +149,25 @@ class G1_29_ArmIK:
         self.regularization_cost = casadi.sumsqr(self.var_q)
         self.smooth_cost = casadi.sumsqr(self.var_q - self.var_q_last)
 
+        # Tighten joint bounds: 85% of URDF for shoulder/elbow, 60% for wrist
+        _ik_lower = self.reduced_robot.model.lowerPositionLimit.copy()
+        _ik_upper = self.reduced_robot.model.upperPositionLimit.copy()
+        _SHOULDER_ELBOW = [0, 1, 2, 3, 7, 8, 9, 10]
+        _WRIST = [4, 5, 6, 11, 12, 13]
+        for i in _SHOULDER_ELBOW:
+            _ik_lower[i] *= 0.85
+            _ik_upper[i] *= 0.85
+        for i in _WRIST:
+            _ik_lower[i] *= 0.60
+            _ik_upper[i] *= 0.60
+
+        # Disabled joints: lock to q=0 in the optimizer
+        _DISABLED_IK_JOINTS = {5}  # L_WristPitch — match _G1_29_DISABLED_ARM_JOINTS
+        for j in _DISABLED_IK_JOINTS:
+            self.opti.subject_to(self.var_q[j] == 0.0)
+
         # Setting optimization constraints and goals
-        self.opti.subject_to(self.opti.bounded(
-            self.reduced_robot.model.lowerPositionLimit,
-            self.var_q,
-            self.reduced_robot.model.upperPositionLimit)
-        )
+        self.opti.subject_to(self.opti.bounded(_ik_lower, self.var_q, _ik_upper))
         self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
 
         opts = {
