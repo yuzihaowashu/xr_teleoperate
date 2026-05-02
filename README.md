@@ -11,6 +11,42 @@
   </p>
 </div>
 
+> **WashU G1/PICO fork note**
+>
+> This fork is pinned by the parent repository
+> `yuzihaowashu/Robot_Learning_Infra-WashU_Humanoid_Robot_Group` for the
+> `teleop_vla_infer` branch. It keeps the upstream Unitree `xr_teleoperate`
+> structure, but adds the G1 + Dex3 + PICO workflow used by the WashU Humanoid
+> Robot Group.
+>
+> Main WashU changes:
+>
+> - Controller-only PICO workflow through the parent Gradio panel.
+> - Dynamic episode recording: `Left X` starts/resumes an episode, `Right A`
+>   stops and saves it, then `Left X` starts the next episode.
+> - Safer stop/relax behavior for G1 + Dex3 hands, including arm parking,
+>   finger release, and `arm_idle_holder` coordination.
+> - VR pose guard, controller pose recalibration, pose jump rejection, and
+>   start ramping to avoid sudden arm drops at teleop start.
+> - PC VR mirror support for audience observation.
+> - `teleop/televuer` is pinned to the WashU fork because it exposes
+>   `last_event_time` for VR connection monitoring.
+>
+> Recommended entry point from the parent repository:
+>
+> ```bash
+> cd Robot_Learning_Infra-WashU_Humanoid_Robot_Group
+> bash run_xr_session.sh
+> ```
+>
+> Direct CLI entry point from this submodule:
+>
+> ```bash
+> cd xr_teleoperate/teleop
+> conda activate tv
+> python teleop_hand_and_arm.py --arm=G1_29 --ee=dex3 --input-mode=controller --record
+> ```
+
 
 # 📺 Video Demo
 
