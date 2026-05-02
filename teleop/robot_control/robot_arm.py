@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import threading
 import time
@@ -15,10 +16,10 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 def _try_open_hands(duration: float = 1.0):
-    """Best-effort: open Dex3-1 hands. Silently skip if hand module unavailable."""
+    """Best-effort: make Dex3-1 fingers compact before arm motion."""
     try:
-        from teleop.robot_control.robot_hand_unitree import dex3_open_hands
-        dex3_open_hands(duration=duration)
+        from teleop.robot_control.robot_hand_unitree import dex3_prepare_safe_hands
+        dex3_prepare_safe_hands(open_duration=duration, release_duration=0.4)
     except Exception as e:
         logger_mp.debug(f"[_try_open_hands] skipped: {e}")
 
@@ -136,18 +137,77 @@ _G1_29_ARM_Q_UPPER = np.array([
 #            4=L_WristRoll     5=L_WristPitch   6=L_WristYaw
 #            7=R_ShoulderPitch 8=R_ShoulderRoll 9=R_ShoulderYaw 10=R_Elbow
 #           11=R_WristRoll    12=R_WristPitch  13=R_WristYaw
-_G1_29_DISABLED_ARM_JOINTS = {5}  # L_WristPitch — hardware fault, lock to q=0
+# 2026-04-27: motor 20 (L_WristPitch) replaced with new hardware; previously
+# disabled set {5} reverted to empty. Keep the variable so we can re-disable a
+# joint quickly if another fault appears. See todo_docs/motor20_wrist_pitch_fault_report.md.
+_G1_29_DISABLED_ARM_JOINTS: set[int] = set()
+
+_SPREAD_Q = np.zeros(14)
+_SPREAD_Q[1] = 1.5    # L_ShoulderRoll → outward
+_SPREAD_Q[8] = -1.5   # R_ShoulderRoll → outward
+
+_CLEARANCE_Q = np.zeros(14)
+_CLEARANCE_Q[1] = 1.75   # extra outward clearance for default-pose parking
+_CLEARANCE_Q[8] = -1.75
+
+# /tmp PID-file used by utils/arm_idle_holder.py to know when to yield.
+# Teleop writes its own PID here on startup so the holder stops fighting
+# us; we remove the file on clean shutdown so the holder resumes.
+_HOLDER_YIELD_FLAG_PATH = "/tmp/g1_arm_holder_yield.pid"
+
+
+def _publish_yield_flag():
+    """Write our PID into the yield flag so arm_idle_holder pauses."""
+    try:
+        with open(_HOLDER_YIELD_FLAG_PATH, "w") as f:
+            f.write(f"{os.getpid()}\n")
+    except OSError as e:
+        logger_mp.warning(f"[holder-flag] could not write {_HOLDER_YIELD_FLAG_PATH}: {e}")
+
+
+def _clear_yield_flag():
+    """Remove the yield flag so arm_idle_holder resumes spread-pose hold."""
+    try:
+        os.remove(_HOLDER_YIELD_FLAG_PATH)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger_mp.warning(f"[holder-flag] could not remove {_HOLDER_YIELD_FLAG_PATH}: {e}")
+
+
+def _keep_holder_yielding_until_next_teleop():
+    """Pause arm_idle_holder after exit by writing pid 1 as the yield owner."""
+    try:
+        with open(_HOLDER_YIELD_FLAG_PATH, "w") as f:
+            f.write("1\n")
+        logger_mp.warning(
+            "[holder-flag] arm_idle_holder will stay yielded until the next "
+            "teleop/RL process overwrites the flag or the flag is removed."
+        )
+    except OSError as e:
+        logger_mp.warning(f"[holder-flag] could not pause holder: {e}")
+
 
 class G1_29_ArmController:
-    def __init__(self, motion_mode = False, simulation_mode = False, safe_deploy = True):
+    def __init__(self, motion_mode = False, simulation_mode = False,
+                 safe_deploy = True, keep_spread = True):
+        """Args:
+            motion_mode: publish to rt/arm_sdk (True) or rt/lowcmd (False).
+            simulation_mode: skip clip_arm_q_target & velocity limit.
+            safe_deploy: in __init__, open hands then spread shoulders
+                outward before user code runs. Strongly recommended for
+                G1+Dex3 to clear the hands from the body.
+            keep_spread: when True (default 2026-04-27), the safe-deploy
+                phase 2 ("move to home q=0") is SKIPPED. Reason: the
+                default standing pose collides Dex3-1 fingers with the
+                outer thighs; staying at spread keeps them safe. The
+                companion daemon utils/arm_idle_holder.py will continue
+                to hold this pose between teleop sessions. See
+                todo_docs/dex3_hand_error.md.
+        """
         logger_mp.info("Initialize G1_29_ArmController...")
-        if safe_deploy:
-            _spread_q = np.zeros(14)
-            _spread_q[1] = 1.5    # left shoulder roll → outward
-            _spread_q[8] = -1.5   # right shoulder roll → outward
-            self.q_target = _spread_q.copy()
-        else:
-            self.q_target = np.zeros(14)
+        self.keep_spread = keep_spread
+        self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
         self.simulation_mode = simulation_mode
@@ -196,6 +256,7 @@ class G1_29_ArmController:
         self.msg.mode_machine = self.get_mode_machine()
 
         self.all_motor_q = self.get_current_motor_q()
+        self.q_target = self.get_current_dual_arm_q().copy()
         logger_mp.debug(f"Current all body motor state q:\n{self.all_motor_q} \n")
         logger_mp.debug(f"Current two arms motor state q:\n{self.get_current_dual_arm_q()}\n")
         logger_mp.info("Lock all joints except two arms...")
@@ -227,6 +288,11 @@ class G1_29_ArmController:
             self.msg.motor_cmd[j].q = 0.0
         logger_mp.info(f"Lock OK! (waist kp={self.kp_waist}, kd={self.kd_waist}, q=0.0)")
 
+        # Ask arm_idle_holder to yield before our publisher starts. Then hold
+        # the current arm pose while the fingers are made compact.
+        if self.motion_mode:
+            _publish_yield_flag()
+
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
@@ -234,14 +300,22 @@ class G1_29_ArmController:
         self.publish_thread.start()
 
         if safe_deploy:
-            logger_mp.info("[safe_arm_deploy] Phase 0: opening hands...")
+            logger_mp.info("[safe_arm_deploy] Phase 0: closing/releasing hands...")
             _try_open_hands(duration=0.5)
             logger_mp.info("[safe_arm_deploy] Phase 1: arms spreading outward...")
-            time.sleep(1.0)
-            logger_mp.info("[safe_arm_deploy] Phase 2: moving to home q=0...")
             with self.ctrl_lock:
-                self.q_target = np.zeros(14)
+                self.q_target = _SPREAD_Q.copy()
             time.sleep(1.0)
+            if self.keep_spread:
+                logger_mp.info(
+                    "[safe_arm_deploy] keep_spread=True → staying at spread "
+                    "(Dex3 collision avoidance). See todo_docs/dex3_hand_error.md."
+                )
+            else:
+                logger_mp.info("[safe_arm_deploy] Phase 2: moving to home q=0...")
+                with self.ctrl_lock:
+                    self.q_target = np.zeros(14)
+                time.sleep(1.0)
             logger_mp.info("[safe_arm_deploy] Done.")
 
         logger_mp.info("Initialize G1_29_ArmController OK!")
@@ -288,6 +362,7 @@ class G1_29_ArmController:
 
         disabled_motors = set()
         _last_temp_log = 0.0
+        _last_wrist_diag_log = 0.0
 
         while True:
             start_time = time.time()
@@ -341,6 +416,34 @@ class G1_29_ArmController:
                 self.msg.motor_cmd[id].dq = 0
                 self.msg.motor_cmd[id].tau = 0.0
 
+            if low_data is not None and (start_time - _last_wrist_diag_log) > 1.0:
+                _last_wrist_diag_log = start_time
+                wrist_items = [
+                    ("LWR", 4, G1_29_JointArmIndex.kLeftWristRoll),
+                    ("LWP", 5, G1_29_JointArmIndex.kLeftWristPitch),
+                    ("LWY", 6, G1_29_JointArmIndex.kLeftWristyaw),
+                    ("RWR", 11, G1_29_JointArmIndex.kRightWristRoll),
+                    ("RWP", 12, G1_29_JointArmIndex.kRightWristPitch),
+                    ("RWY", 13, G1_29_JointArmIndex.kRightWristYaw),
+                ]
+                diag_parts = []
+                right_err_max = 0.0
+                for name, arm_idx, joint in wrist_items:
+                    actual = low_data.motor_state[joint.value].q
+                    target = cliped_arm_q_target[arm_idx]
+                    err = target - actual
+                    temp = max(low_data.motor_state[joint.value].temperature or (0,))
+                    diag_parts.append(
+                        f"{name}:t={target:.3f} q={actual:.3f} e={err:.3f} T={temp}"
+                    )
+                    if name.startswith("R"):
+                        right_err_max = max(right_err_max, abs(err))
+                msg = "[WRIST_DIAG] " + " | ".join(diag_parts)
+                if right_err_max > 0.18:
+                    logger_mp.warning(msg)
+                else:
+                    logger_mp.info(msg)
+
             for j in _WAIST_JOINTS:
                 self.msg.motor_cmd[j].tau = grav.get(j, 0.0)
 
@@ -378,40 +481,148 @@ class G1_29_ArmController:
         '''Return current state dq of the left and right arm motors.'''
         return np.array([self.lowstate_buffer.GetData().motor_state[id].dq for id in G1_29_JointArmIndex])
     
-    def ctrl_dual_arm_go_home(self):
-        '''Open hands → spread arms outward → move to home (q=0) → slowly ramp down.'''
-        logger_mp.info("[G1_29_ArmController] ctrl_dual_arm_go_home start...")
-
-        # Phase 0: open hands first
-        logger_mp.info("[G1_29_ArmController] go_home: opening hands...")
-        _try_open_hands(duration=0.5)
-
-        # Phase 1: spread outward to clear body
-        spread_q = np.zeros(14)
-        spread_q[1] = 1.5
-        spread_q[8] = -1.5
-        with self.ctrl_lock:
-            self.q_target = spread_q.copy()
-        logger_mp.info("[G1_29_ArmController] go_home: spreading outward...")
-        time.sleep(1.0)
-
-        # Phase 2: move to home (q=0)
-        with self.ctrl_lock:
-            self.q_target = np.zeros(14)
-        logger_mp.info("[G1_29_ArmController] go_home: moving to q=0...")
-        for _ in range(40):
-            current_q = self.get_current_dual_arm_q()
-            if np.all(np.abs(current_q) < 0.1):
+    def _move_dual_arm_waypoint(self, target_q, label,
+                                timeout=5.0, tolerance=0.12,
+                                min_duration=3.0, settle=True):
+        start_q = self.get_current_dual_arm_q()
+        target_q = target_q.copy()
+        update_dt = 0.01
+        logger_mp.info(
+            f"[G1_29_ArmController] go_home: {label} "
+            f"(slow {min_duration:.1f}s)..."
+        )
+        start_time = time.time()
+        while True:
+            elapsed = time.time() - start_time
+            alpha = 1.0 if min_duration <= 0 else min(1.0, elapsed / min_duration)
+            alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            with self.ctrl_lock:
+                self.q_target = (1.0 - alpha) * start_q + alpha * target_q
+            if alpha >= 1.0:
                 break
-            time.sleep(0.05)
+            time.sleep(update_dt)
 
-        # Phase 3: slowly ramp down arm_sdk weight
+        if settle:
+            deadline = time.time() + max(0.0, timeout - min_duration)
+            while time.time() < deadline:
+                current_q = self.get_current_dual_arm_q()
+                if np.max(np.abs(current_q - target_q)) < tolerance:
+                    break
+                time.sleep(update_dt)
+
+    def ctrl_dual_arm_go_home(self, lower_to_zero: bool = None,
+                              keep_holder_yield: bool = False,
+                              skip_spread: bool = False,
+                              clearance_path: bool = False,
+                              spread_min_duration: float = 2.0,
+                              spread_timeout: float = 4.0,
+                              spread_settle: bool = True,
+                              prepare_hands: bool = True,
+                              hand_settle_time: float = 0.3,
+                              skip_zero_waypoint: bool = False):
+        '''Park the arms safely on teleop exit.
+
+        Default behavior (since 2026-04-27): open hands → spread outward →
+        STAY at spread (kNotUsedJoint0 weight stays = 1.0). The companion
+        utils/arm_idle_holder.py daemon takes over right after we exit.
+        This avoids the Dex3-1 fingers getting crushed against the outer
+        thighs by the FSM's q=0 default standing pose.
+
+        Pass `lower_to_zero=True` (or set self.keep_spread=False) to fall
+        back to the legacy behavior: spread → q=0 → ramp arm_sdk weight
+        down to 0 (release control).  Only do that if you have first
+        verified that the Dex3 hands cannot collide in the resulting pose
+        (e.g. after a hand replacement / mechanical re-design).
+
+        Pass `keep_holder_yield=True` together with lower_to_zero when the
+        user explicitly wants the factory/default arm pose after teleop exit;
+        otherwise arm_idle_holder will resume and spread the arms again.
+
+        Pass `clearance_path=True` for relax-to-default through an outward
+        arc when needed; if already at the safe outer pose, go directly to q=0.
+
+        Pass `skip_zero_waypoint=True` to avoid commanding the forward-ish
+        q=0 arm pose before releasing arm_sdk control. This is useful when
+        q=0 brings Dex3 hands close to the body.
+        '''
+        if lower_to_zero is None:
+            lower_to_zero = not getattr(self, "keep_spread", True)
+
+        logger_mp.info(
+            f"[G1_29_ArmController] ctrl_dual_arm_go_home "
+            f"start  (lower_to_zero={lower_to_zero})..."
+        )
+
+        if prepare_hands:
+            # Phase 0: make fingers compact first.
+            logger_mp.info("[G1_29_ArmController] go_home: closing/releasing hands...")
+            _try_open_hands(duration=0.5)
+            time.sleep(hand_settle_time)
+
+        if clearance_path and lower_to_zero:
+            current_q = self.get_current_dual_arm_q()
+            non_roll_idx = [i for i in range(14) if i not in (1, 8)]
+            already_outer = (
+                current_q[1] > 1.25 and current_q[8] < -1.25
+                and np.max(np.abs(current_q[non_roll_idx])) < 0.35
+            )
+            if already_outer:
+                logger_mp.info(
+                    "[G1_29_ArmController] go_home: already at outer "
+                    "clearance pose; skip extra upward/outward waypoint."
+                )
+            else:
+                outer_default = _CLEARANCE_Q.copy()
+                self._move_dual_arm_waypoint(
+                    outer_default, "following outer clearance arc",
+                    timeout=5.0, min_duration=5.0, settle=False
+                )
+        elif skip_spread:
+            logger_mp.info("[G1_29_ArmController] go_home: skipping spread.")
+        else:
+            # Phase 1: spread outward to clear body.
+            self._move_dual_arm_waypoint(
+                _SPREAD_Q, "spreading outward",
+                timeout=spread_timeout, min_duration=spread_min_duration,
+                settle=spread_settle,
+            )
+
+        if not lower_to_zero:
+            # New default: hand off to arm_idle_holder. Clear yield flag so
+            # the holder's next loop tick takes over publishing rt/arm_sdk.
+            logger_mp.info(
+                "[G1_29_ArmController] go_home: keep_spread=True → "
+                "leaving arms at spread + arm_sdk weight=1, releasing "
+                "yield flag for arm_idle_holder."
+            )
+            if self.motion_mode:
+                _clear_yield_flag()
+                # Give the holder a few publish cycles to wake up.
+                time.sleep(0.5)
+            return
+
+        if skip_zero_waypoint:
+            logger_mp.info(
+                "[G1_29_ArmController] go_home: skipping q=0 waypoint; "
+                "releasing arm_sdk from current safe pose."
+            )
+        else:
+            # Final phase — move to factory/default arm pose.
+            self._move_dual_arm_waypoint(
+                np.zeros(14), "moving to q=0", timeout=7.0, min_duration=7.0,
+                settle=not clearance_path,
+            )
+
         if self.motion_mode:
             logger_mp.info("[G1_29_ArmController] go_home: ramping down slowly...")
             for weight in np.linspace(1, 0, num=201):
                 self.msg.motor_cmd[G1_29_JointIndex.kNotUsedJoint0].q = weight
                 time.sleep(0.02)
             logger_mp.info("[G1_29_ArmController] arm_sdk weight = 0, control released.")
+            if keep_holder_yield:
+                _keep_holder_yielding_until_next_teleop()
+            else:
+                _clear_yield_flag()
 
     def safe_arm_deploy(self, spread_time=2.0, home_time=2.0):
         """Move arms outward first (avoid body collision), then to home (q=0).

@@ -64,6 +64,77 @@ def dex3_open_hands(duration: float = 1.0, kp: float = 1.0, kd: float = 0.3):
         time.sleep(0.01)
     logger_mp.info(f"[dex3_open_hands] Sent OPEN for {duration:.1f}s")
 
+
+def dex3_close_hands(duration: float = 0.8, kp: float = 0.4, kd: float = 0.15):
+    """Send a soft CLOSED command to make Dex3 fingers compact."""
+    left_pub = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
+    left_pub.Init()
+    right_pub = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
+    right_pub.Init()
+
+    def _mode(motor_id):
+        return (motor_id & 0x0F) | ((0x01 & 0x07) << 4)
+
+    t_end = time.time() + duration
+    while time.time() < t_end:
+        cmd_left = unitree_hg_msg_dds__HandCmd_()
+        cmd_right = unitree_hg_msg_dds__HandCmd_()
+        for i in range(Dex3_Num_Motors):
+            cmd_left.motor_cmd[i].mode = _mode(i)
+            cmd_left.motor_cmd[i].q = float(DEX3_LEFT_CLOSE_Q[i])
+            cmd_left.motor_cmd[i].dq = 0.0
+            cmd_left.motor_cmd[i].tau = 0.0
+            cmd_left.motor_cmd[i].kp = kp
+            cmd_left.motor_cmd[i].kd = kd
+
+            cmd_right.motor_cmd[i].mode = _mode(i)
+            cmd_right.motor_cmd[i].q = float(DEX3_RIGHT_CLOSE_Q[i])
+            cmd_right.motor_cmd[i].dq = 0.0
+            cmd_right.motor_cmd[i].tau = 0.0
+            cmd_right.motor_cmd[i].kp = kp
+            cmd_right.motor_cmd[i].kd = kd
+        left_pub.Write(cmd_left)
+        right_pub.Write(cmd_right)
+        time.sleep(0.01)
+    logger_mp.info(f"[dex3_close_hands] Sent CLOSE for {duration:.1f}s")
+
+
+def dex3_release_hands(duration: float = 0.5):
+    """Release Dex3-1 position hold so fingers can be moved by hand."""
+    left_pub = ChannelPublisher(kTopicDex3LeftCommand, HandCmd_)
+    left_pub.Init()
+    right_pub = ChannelPublisher(kTopicDex3RightCommand, HandCmd_)
+    right_pub.Init()
+
+    def _mode(motor_id):
+        return motor_id & 0x0F
+
+    t_end = time.time() + duration
+    while time.time() < t_end:
+        cmd_left = unitree_hg_msg_dds__HandCmd_()
+        cmd_right = unitree_hg_msg_dds__HandCmd_()
+        for i in range(Dex3_Num_Motors):
+            for cmd in (cmd_left, cmd_right):
+                cmd.motor_cmd[i].mode = _mode(i)
+                cmd.motor_cmd[i].q = 0.0
+                cmd.motor_cmd[i].dq = 0.0
+                cmd.motor_cmd[i].tau = 0.0
+                cmd.motor_cmd[i].kp = 0.0
+                cmd.motor_cmd[i].kd = 0.0
+        left_pub.Write(cmd_left)
+        right_pub.Write(cmd_right)
+        time.sleep(0.01)
+    logger_mp.info(f"[dex3_release_hands] Sent RELEASE for {duration:.1f}s")
+
+
+def dex3_prepare_safe_hands(open_duration: float = 0.6,
+                            release_duration: float = 0.4):
+    """Close Dex3 softly, then release hold before nearby arm motions."""
+    dex3_close_hands(duration=open_duration, kp=0.4, kd=0.15)
+    dex3_release_hands(duration=release_duration)
+    logger_mp.info("[dex3_prepare_safe_hands] Hands closed softly and released.")
+
+
 class Dex3_1_Controller:
     def __init__(self, left_hand_array_in, right_hand_array_in, dual_hand_data_lock = None, dual_hand_state_array_out = None,
                        dual_hand_action_array_out = None, fps = 100.0, Unit_Test = False, simulation_mode = False,
@@ -130,7 +201,9 @@ class Dex3_1_Controller:
             logger_mp.warning("[Dex3_1_Controller] Waiting to subscribe dds...")
         logger_mp.info("[Dex3_1_Controller] Subscribe dds ok.")
 
-        hand_control_thread = threading.Thread(
+        self.running = True
+        self.release_on_stop = True
+        self.hand_control_thread = threading.Thread(
             target=self.control_process,
             args=(left_hand_array_in, right_hand_array_in,
                   self.left_hand_state_array, self.right_hand_state_array,
@@ -138,7 +211,7 @@ class Dex3_1_Controller:
                   left_trigger_value, right_trigger_value),
             daemon=True,
         )
-        hand_control_thread.start()
+        self.hand_control_thread.start()
 
         logger_mp.info("Initialize Dex3_1_Controller OK!")
 
@@ -163,8 +236,6 @@ class Dex3_1_Controller:
     def control_process(self, left_hand_array_in, right_hand_array_in, left_hand_state_array, right_hand_state_array,
                               dual_hand_data_lock = None, dual_hand_state_array_out = None, dual_hand_action_array_out = None,
                               left_trigger_value = None, right_trigger_value = None):
-        self.running = True
-
         left_q_target  = np.full(Dex3_Num_Motors, 0.0)
         right_q_target = np.full(Dex3_Num_Motors, 0.0)
 
@@ -252,7 +323,17 @@ class Dex3_1_Controller:
                 sleep_time = max(0, (1 / self.fps) - time_elapsed)
                 time.sleep(sleep_time)
         finally:
+            if not self.simulation_mode and self.release_on_stop:
+                dex3_release_hands(duration=0.5)
             logger_mp.info("Dex3_1_Controller has been closed.")
+
+    def close(self, release: bool = True):
+        self.release_on_stop = release
+        self.running = False
+        if hasattr(self, "hand_control_thread"):
+            self.hand_control_thread.join(timeout=1.5)
+        if not self.simulation_mode and release:
+            dex3_release_hands(duration=0.5)
 
 class Dex3_1_Left_JointIndex(IntEnum):
     kLeftHandThumb0 = 0

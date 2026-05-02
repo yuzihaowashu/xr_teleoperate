@@ -162,8 +162,25 @@ if __name__ == '__main__':
     parser.add_argument('--img-server-ip', type=str, default='192.168.123.164', help='IP address of image server, used by teleimager and televuer')
     parser.add_argument('--network-interface', type=str, default=None, help='Network interface for dds communication, e.g., eth0, wlan0. If None, use default interface.')
     # mode flags
-    parser.add_argument('--motion', action = 'store_true', help = 'Enable motion control mode')
+    parser.add_argument(
+        '--motion',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Keep Unitree motion/balance mode active and publish arms through rt/arm_sdk. Use --no-motion only for debug/bench tests.',
+    )
     parser.add_argument('--headless', action='store_true', help='Enable headless mode (no display)')
+    parser.add_argument('--auto-start-on-vr', action='store_true', help='Start tracking automatically once fresh VR data is detected')
+    parser.add_argument('--auto-start-stable-sec', type=float, default=2.0, help='Seconds of continuous fresh VR data required before auto-start')
+    parser.add_argument('--mirror-vr', action=argparse.BooleanOptionalAction, default=True, help='Show the VR camera/HUD mirror on the PC monitor')
+    parser.add_argument('--force-zmq-video', action='store_true', help='Disable PC2 WebRTC and stream camera frames through the local TeleVuer page')
+    parser.add_argument('--vr-pose-jump-threshold', type=float, default=0.15,
+                        help='Pause controller tracking if one-frame wrist target jump exceeds this distance in meters')
+    parser.add_argument('--vr-pose-filter-alpha', type=float, default=0.35,
+                        help='Low-pass filter alpha for accepted controller wrist targets')
+    parser.add_argument('--teleop-start-ramp-sec', type=float, default=2.5,
+                        help='Seconds to blend from current arm joints to first IK targets after start/resume')
+    parser.add_argument('--park-arms-on-stop', choices=['spread', 'default'], default='spread',
+                        help='Final teleop stop pose: spread keeps Dex3 hands away from thighs; default releases to the factory arm pose and pauses arm_idle_holder.')
     parser.add_argument('--sim', action = 'store_true', help = 'Enable isaac simulation mode')
     parser.add_argument('--ipc', action = 'store_true', help = 'Enable IPC server to handle input; otherwise enable sshkeyboard')
     parser.add_argument('--affinity', action = 'store_true', help = 'Enable high priority and set CPU affinity mode')
@@ -199,8 +216,28 @@ if __name__ == '__main__':
         # image client
         img_client = ImageClient(host=args.img_server_ip, request_bgr=True)
         camera_config = img_client.get_cam_config()
+        if args.force_zmq_video:
+            camera_config['head_camera']['enable_webrtc'] = False
+            logger_mp.info("[video] force_zmq_video=True -> using host ZMQ frames for PICO display")
         logger_mp.debug(f"Camera config: {camera_config}")
         xr_need_local_img = not (args.display_mode == 'pass-through' or camera_config['head_camera']['enable_webrtc'])
+        pc_mirror_enabled = args.mirror_vr and not args.headless and camera_config['head_camera']['enable_zmq']
+        pc_mirror_state = {"enabled": pc_mirror_enabled, "warned": False}
+
+        def show_pc_mirror(frame):
+            """Best-effort PC observer window; never crash teleop if OpenCV has no GUI backend."""
+            if not pc_mirror_state["enabled"]:
+                return
+            try:
+                cv2.imshow("VR Mirror", frame)
+                cv2.waitKey(1)
+            except cv2.error as exc:
+                pc_mirror_state["enabled"] = False
+                if not pc_mirror_state["warned"]:
+                    pc_mirror_state["warned"] = True
+                    logger_mp.warning(
+                        f"[VR Mirror] disabled because OpenCV GUI is unavailable: {exc}"
+                    )
 
         # televuer_wrapper: obtain hand pose data from the XR device and transmit the robot's head camera image to the XR device.
         tv_wrapper = TeleVuerWrapper(use_hand_tracking=args.input_mode == "hand", 
@@ -215,14 +252,19 @@ if __name__ == '__main__':
                                      webrtc_url=f"https://{args.img_server_ip}:{camera_config['head_camera']['webrtc_port']}/offer",
                                      )
         
-        # motion mode (G1: Regular mode R1+X, not Running mode R2+A)
+        # Motion mode keeps Unitree's balance/locomotion controller alive and
+        # sends arm commands through rt/arm_sdk. Debug mode releases that
+        # controller and is only for bench/debug use.
         if args.motion:
             if args.input_mode == "controller":
                 loco_wrapper = LocoClientWrapper()
         else:
             motion_switcher = MotionSwitcher()
             status, result = motion_switcher.Enter_Debug_Mode()
-            logger_mp.info(f"Enter debug mode: {'Success' if status == 0 else 'Failed'}")
+            logger_mp.warning(
+                f"Enter debug mode: {'Success' if status == 0 else 'Failed'}; "
+                "leg balance/motion controller may be released."
+            )
 
         # arm
         if args.arm == "G1_29":
@@ -333,11 +375,16 @@ if __name__ == '__main__':
             _tbl.add_column(style="bold")
             _tbl.add_column()
             _tbl.add_row("[green]Keyboard [r][/]", "Start tracking")
-            _tbl.add_row("[green]VR Left X[/]", "Start tracking (controller mode)")
+            if args.auto_start_on_vr:
+                _tbl.add_row("[green]PICO Enter VR[/]", "Auto-start tracking")
+            _tbl.add_row("[green]VR Left X[/]", "Start/resume + record episode")
             if args.record:
-                _tbl.add_row("[yellow]Keyboard [s] / VR Right B[/]", "Toggle recording")
+                _tbl.add_row("[yellow]VR Right A[/]", "Stop episode + save")
+                _tbl.add_row("[yellow]Keyboard [s] / VR Right B[/]", "Toggle recording (manual)")
+            if pc_mirror_state["enabled"]:
+                _tbl.add_row("[blue]PC window[/]", "VR Mirror for audience")
             _tbl.add_row("[magenta]Keyboard [m][/]", "Toggle locomotion (default OFF)")
-            _tbl.add_row("[red]Keyboard [q] / VR Right A[/]", "Stop & exit")
+            _tbl.add_row("[red]Keyboard [q][/]", "Stop & exit teleop")
             _tbl.add_row("[cyan]Both joysticks pressed[/]", "Emergency damping")
             _con.print(Panel(_tbl, title="[bold]XR Teleoperate[/]",
                              subtitle=f"arm={args.arm}  ee={args.ee}  input={args.input_mode}  record={'ON' if args.record else 'OFF'}  loco=OFF",
@@ -347,43 +394,166 @@ if __name__ == '__main__':
             logger_mp.info("Press [r] to start, [s] to toggle recording, [q] to quit.")
         READY = True                  # now ready to (1) enter START state
         _x_button_held = False
+        _a_button_held = False
+        _b_button_held = False
+        _VR_STALE_THRESHOLD = 2.0
+        _vr_fresh_since = None
         while not START and not STOP: # wait for start or stop signal.
             time.sleep(0.033)
-            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+            if camera_config['head_camera']['enable_zmq'] and (xr_need_local_img or pc_mirror_state["enabled"]):
                 head_img = img_client.get_head_frame()
                 if head_img is not None and head_img.bgr is not None:
                     _frame = draw_vr_hud(head_img.bgr.copy(), False, False, True, True, LOCO_ENABLED)
-                    tv_wrapper.render_to_xr(_frame)
+                    if xr_need_local_img:
+                        tv_wrapper.render_to_xr(_frame)
+                    show_pc_mirror(_frame)
+            _evt_time = tv_wrapper.last_event_time
+            _vr_fresh = (_evt_time > 0) and (time.time() - _evt_time < _VR_STALE_THRESHOLD)
+            if _vr_fresh:
+                if _vr_fresh_since is None:
+                    _vr_fresh_since = time.time()
+            else:
+                _vr_fresh_since = None
+            if args.auto_start_on_vr and _vr_fresh_since is not None:
+                stable_for = time.time() - _vr_fresh_since
+                if stable_for >= args.auto_start_stable_sec:
+                    START = True
+                    logger_mp.info(
+                        f"[VR] Fresh VR data stable for {stable_for:.1f}s -> auto-start tracking"
+                    )
+                    push_event("VR connected and stable. Auto-start tracking.")
+                    break
             if args.input_mode == "controller" and hasattr(tv_wrapper, 'tvuer'):
                 if tv_wrapper.tvuer.left_ctrl_aButton:
                     if not _x_button_held:
                         _x_button_held = True
                         START = True
                         logger_mp.info("[VR] Left X button pressed → start tracking")
+                        if args.record:
+                            RECORD_TOGGLE = True
+                        _need_pose_guard_reset = True
                 else:
                     _x_button_held = False
 
         logger_mp.info("---------------------🚀start Tracking🚀-------------------------")
         push_event("Start teleoperation")
         arm_ctrl.speed_gradual_max()
-        _b_button_held = False
         _vr_connected = True
-        _VR_STALE_THRESHOLD = 2.0
         _tracking_paused = False
+        _pause_after_episode = False
+        _need_pose_guard_reset = True
+        _need_start_ramp_reset = True
+        _pose_guard = {
+            "left_prev": None,
+            "right_prev": None,
+            "left_filtered": None,
+            "right_filtered": None,
+        }
+        _start_ramp = {
+            "start_time": None,
+            "start_q": None,
+            "logged_done": False,
+        }
+
+        def _reset_pose_guard(reason: str):
+            _pose_guard["left_prev"] = None
+            _pose_guard["right_prev"] = None
+            _pose_guard["left_filtered"] = None
+            _pose_guard["right_filtered"] = None
+            logger_mp.info(f"[VR_POSE_GUARD] reset: {reason}")
+
+        def _apply_pose_guard(tele_data):
+            """Reject sudden OpenXR pose jumps and smooth accepted targets."""
+            left_pos = tele_data.left_wrist_pose[:3, 3].copy()
+            right_pos = tele_data.right_wrist_pose[:3, 3].copy()
+            if _pose_guard["left_prev"] is None:
+                _pose_guard["left_prev"] = left_pos
+                _pose_guard["right_prev"] = right_pos
+                _pose_guard["left_filtered"] = tele_data.left_wrist_pose.copy()
+                _pose_guard["right_filtered"] = tele_data.right_wrist_pose.copy()
+                logger_mp.info("[VR_POSE_GUARD] calibrated controller reference")
+                return True
+
+            left_jump = float(np.linalg.norm(left_pos - _pose_guard["left_prev"]))
+            right_jump = float(np.linalg.norm(right_pos - _pose_guard["right_prev"]))
+            jump = max(left_jump, right_jump)
+            if jump > args.vr_pose_jump_threshold:
+                logger_mp.warning(
+                    f"[VR_POSE_GUARD] pose jump {jump:.3f}m "
+                    f"(L={left_jump:.3f}, R={right_jump:.3f})"
+                )
+                return False
+
+            alpha = float(np.clip(args.vr_pose_filter_alpha, 0.0, 1.0))
+            for side in ("left", "right"):
+                pose = getattr(tele_data, f"{side}_wrist_pose")
+                filt_key = f"{side}_filtered"
+                filtered = _pose_guard[filt_key].copy()
+                filtered[:3, 3] = (
+                    (1.0 - alpha) * filtered[:3, 3] + alpha * pose[:3, 3]
+                )
+                # Keep current orientation; only smooth translation to avoid laggy wrist rotation.
+                filtered[:3, :3] = pose[:3, :3]
+                setattr(tele_data, f"{side}_wrist_pose", filtered)
+                _pose_guard[filt_key] = filtered
+                _pose_guard[f"{side}_prev"] = pose[:3, 3].copy()
+            return True
+
+        def _reset_start_ramp(reason: str):
+            ramp_sec = max(0.0, float(args.teleop_start_ramp_sec))
+            if ramp_sec <= 0:
+                _start_ramp["start_time"] = None
+                _start_ramp["start_q"] = None
+                return
+            _start_ramp["start_time"] = time.time()
+            _start_ramp["start_q"] = arm_ctrl.get_current_dual_arm_q().copy()
+            _start_ramp["logged_done"] = False
+            logger_mp.info(f"[START_RAMP] reset: {reason}, duration={ramp_sec:.1f}s")
+            push_event(f"Start ramp active ({ramp_sec:.1f}s)")
+
+        def _apply_start_ramp(sol_q):
+            if _start_ramp["start_time"] is None or _start_ramp["start_q"] is None:
+                return sol_q
+            ramp_sec = max(0.0, float(args.teleop_start_ramp_sec))
+            elapsed = time.time() - _start_ramp["start_time"]
+            if ramp_sec <= 0 or elapsed >= ramp_sec:
+                if not _start_ramp["logged_done"]:
+                    logger_mp.info("[START_RAMP] complete")
+                    _start_ramp["logged_done"] = True
+                _start_ramp["start_time"] = None
+                _start_ramp["start_q"] = None
+                return sol_q
+            alpha = elapsed / ramp_sec
+            alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+            return (1.0 - alpha) * _start_ramp["start_q"] + alpha * sol_q
+
         # main loop. robot start to follow VR user's motion
         while not STOP:
             start_time = time.time()
 
-            # --- A button (stop) — checked first so it ALWAYS works ---
+            # --- Right A: finish current episode; keyboard q / panel stop exits teleop ---
             if args.input_mode == "controller" and hasattr(tv_wrapper, 'tvuer'):
                 try:
                     if tv_wrapper.tvuer.right_ctrl_aButton:
-                        if args.motion:
-                            loco_wrapper.Move(0, 0, 0)
-                        START = False
-                        STOP = True
-                        push_event("Stop teleoperation")
-                        continue
+                        if not _a_button_held:
+                            _a_button_held = True
+                            if args.motion:
+                                loco_wrapper.Move(0, 0, 0)
+                            if args.record:
+                                if RECORD_RUNNING:
+                                    RECORD_TOGGLE = True
+                                    _pause_after_episode = True
+                                    push_event("Stop episode. Saving...")
+                                    logger_mp.info("[VR] Right A button pressed -> stop episode and save")
+                                else:
+                                    push_event("No active episode. Press X to start recording.")
+                            else:
+                                START = False
+                                STOP = True
+                                push_event("Stop teleoperation")
+                                continue
+                    else:
+                        _a_button_held = False
                 except Exception:
                     pass
 
@@ -409,28 +579,35 @@ if __name__ == '__main__':
                         if not _x_button_held:
                             _x_button_held = True
                             _tracking_paused = False
+                            START = True
+                            _need_pose_guard_reset = True
+                            _need_start_ramp_reset = True
+                            if args.record and not RECORD_RUNNING:
+                                RECORD_TOGGLE = True
+                                push_event("Start next episode")
                             logger_mp.info("[VR] Resumed tracking after reconnection")
-                            push_event("Tracking resumed")
+                            push_event("Tracking resumed. Controller pose recalibrated.")
                     else:
                         _x_button_held = False
-                if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                if camera_config['head_camera']['enable_zmq'] and (xr_need_local_img or pc_mirror_state["enabled"]):
                     head_img = img_client.get_head_frame()
                     if head_img is not None and head_img.bgr is not None:
                         _frame = draw_vr_hud(head_img.bgr.copy(), False, False, _vr_connected, True, LOCO_ENABLED)
-                        tv_wrapper.render_to_xr(_frame)
+                        if xr_need_local_img:
+                            tv_wrapper.render_to_xr(_frame)
+                        show_pc_mirror(_frame)
                 time.sleep(0.033)
                 continue
 
             # get image
             if camera_config['head_camera']['enable_zmq']:
-                if args.record or xr_need_local_img:
+                if args.record or xr_need_local_img or pc_mirror_state["enabled"]:
                     head_img = img_client.get_head_frame()
-                if xr_need_local_img and head_img is not None and head_img.bgr is not None:
+                if (xr_need_local_img or pc_mirror_state["enabled"]) and head_img is not None and head_img.bgr is not None:
                     _frame = draw_vr_hud(head_img.bgr.copy(), True, RECORD_RUNNING, _vr_connected, False, LOCO_ENABLED)
-                    tv_wrapper.render_to_xr(_frame)
-                    if not args.headless:
-                        cv2.imshow("VR Mirror", _frame)
-                        cv2.waitKey(1)
+                    if xr_need_local_img:
+                        tv_wrapper.render_to_xr(_frame)
+                    show_pc_mirror(_frame)
             if camera_config['left_wrist_camera']['enable_zmq']:
                 if args.record:
                     left_wrist_img = img_client.get_left_wrist_frame()
@@ -444,25 +621,29 @@ if __name__ == '__main__':
                 if not RECORD_RUNNING:
                     if recorder.create_episode():
                         RECORD_RUNNING = True
-                        push_event("Start recording")
+                        push_event(f"Start recording episode {recorder.episode_id:04d}")
                     else:
                         logger_mp.error("Failed to create episode. Recording not started.")
                         push_event("Recording failed")
                 else:
+                    saved_episode_id = recorder.episode_id
                     RECORD_RUNNING = False
                     recorder.save_episode()
-                    push_event("Saving episode...")
+                    push_event(f"Saving episode {saved_episode_id:04d}...")
+                    _save_status = {"text": f"SAVING EPISODE {saved_episode_id:04d}..."}
 
                     def _keep_vr_alive():
                         try:
-                            if camera_config['head_camera']['enable_zmq'] and xr_need_local_img:
+                            if camera_config['head_camera']['enable_zmq'] and (xr_need_local_img or pc_mirror_state["enabled"]):
                                 _hf = img_client.get_head_frame()
                                 if _hf is not None and _hf.bgr is not None:
                                     _fr = draw_vr_hud(_hf.bgr.copy(), True, False, _vr_connected, False, LOCO_ENABLED)
-                                    tv_wrapper.render_to_xr(_fr)
-                                    if not args.headless:
-                                        cv2.imshow("VR Mirror", _fr)
-                                        cv2.waitKey(1)
+                                    h, w = _fr.shape[:2]
+                                    cv2.putText(_fr, _save_status["text"], (max(20, w // 2 - 260), h // 2),
+                                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 220, 255), 3)
+                                    if xr_need_local_img:
+                                        tv_wrapper.render_to_xr(_fr)
+                                    show_pc_mirror(_fr)
                         except Exception:
                             pass
 
@@ -474,12 +655,17 @@ if __name__ == '__main__':
                         time.sleep(0.033)
                         _keep_vr_alive()
 
-                    push_event("Episode saved. Returning arms home...")
+                    push_event(f"Episode {saved_episode_id:04d} saved. Returning arms home...")
+                    _save_status["text"] = f"EPISODE {saved_episode_id:04d} SAVED"
 
                     _go_home_done = threading.Event()
                     def _do_go_home():
                         try:
-                            arm_ctrl.ctrl_dual_arm_go_home()
+                            arm_ctrl.ctrl_dual_arm_go_home(
+                                spread_min_duration=4.0,
+                                spread_timeout=6.0,
+                                prepare_hands=False,
+                            )
                         except Exception as _e:
                             logger_mp.error(f"go_home failed: {_e}")
                         finally:
@@ -488,12 +674,38 @@ if __name__ == '__main__':
                     while not _go_home_done.wait(timeout=0.033):
                         _keep_vr_alive()
 
-                    push_event("Ready for next episode.")
+                    push_event(f"Episode {saved_episode_id:04d} saved. Press X for next episode.")
+                    _save_status["text"] = f"READY - PRESS X FOR NEXT EPISODE"
+                    for _ in range(15):
+                        time.sleep(0.033)
+                        _keep_vr_alive()
+                    if _pause_after_episode:
+                        START = False
+                        _tracking_paused = True
+                        _pause_after_episode = False
                     if args.sim:
                         publish_reset_category(1, reset_pose_publisher)
+                    if _tracking_paused:
+                        time.sleep(0.033)
+                        continue
 
             # get xr's tele data
             tele_data = tv_wrapper.get_tele_data()
+            if args.input_mode == "controller":
+                if _need_pose_guard_reset:
+                    _reset_pose_guard("Left X start/resume")
+                    _need_pose_guard_reset = False
+                if _need_start_ramp_reset:
+                    _reset_start_ramp("Left X start/resume")
+                    _need_start_ramp_reset = False
+                if not _apply_pose_guard(tele_data):
+                    _tracking_paused = True
+                    START = False
+                    if args.motion:
+                        loco_wrapper.Move(0, 0, 0)
+                    push_event("VR pose jump detected. Press X to recalibrate.")
+                    time.sleep(0.033)
+                    continue
             if (args.ee == "dex3" or args.ee == "inspire_dfx" or args.ee == "inspire_ftp" or args.ee == "brainco") and args.input_mode == "hand":
                 with left_hand_pos_array.get_lock():
                     left_hand_pos_array[:] = tele_data.left_hand_pos.flatten()
@@ -515,23 +727,18 @@ if __name__ == '__main__':
             else:
                 pass
             
-            # high level control
-            if args.input_mode == "controller" and args.motion:
-                # quit teleoperate
-                if tele_data.right_ctrl_aButton:
-                    loco_wrapper.Move(0, 0, 0)
-                    START = False
-                    STOP = True
-                    push_event("Stop teleoperation")
-                    continue
-                # B button: toggle recording (same as keyboard [s])
+            # VR Right B toggles recording even when locomotion is disabled.
+            if args.input_mode == "controller":
                 if args.record and tele_data.right_ctrl_bButton:
                     if not _b_button_held:
                         _b_button_held = True
                         RECORD_TOGGLE = True
-                        logger_mp.info("[VR] Right B button pressed → toggle recording")
+                        logger_mp.info("[VR] Right B button pressed -> toggle recording")
                 else:
                     _b_button_held = False
+
+            # high level locomotion control
+            if args.input_mode == "controller" and args.motion:
                 # command robot to enter damping mode. soft emergency stop function
                 if tele_data.left_ctrl_thumbstick and tele_data.right_ctrl_thumbstick:
                     loco_wrapper.Damp()
@@ -550,6 +757,8 @@ if __name__ == '__main__':
             # solve ik using motor data and wrist pose, then use ik results to control arms.
             time_ik_start = time.time()
             sol_q, sol_tauff  = arm_ik.solve_ik(tele_data.left_wrist_pose, tele_data.right_wrist_pose, current_lr_arm_q, current_lr_arm_dq)
+            if args.input_mode == "controller":
+                sol_q = _apply_start_ramp(sol_q)
             time_ik_end = time.time()
             logger_mp.debug(f"ik:\t{round(time_ik_end - time_ik_start, 6)}")
 
@@ -725,6 +934,31 @@ if __name__ == '__main__':
         except Exception as e:
             logger_mp.error(f"Failed to stop locomotion: {e}")
 
+        _end_effector_closed = {"done": False}
+        def _close_end_effector_controller():
+            if _end_effector_closed["done"]:
+                return
+            try:
+                if args.ee == "dex3":
+                    from teleop.robot_control.robot_hand_unitree import dex3_close_hands
+                    hand_ctrl.close(release=False)
+                    dex3_close_hands(duration=0.5, kp=0.45, kd=0.15)
+                elif args.ee in ("inspire_dfx", "inspire_ftp", "brainco") and hasattr(hand_ctrl, "close"):
+                    hand_ctrl.close()
+                elif args.ee == "dex1" and hasattr(gripper_ctrl, "close"):
+                    gripper_ctrl.close()
+                _end_effector_closed["done"] = True
+            except Exception as e:
+                logger_mp.error(f"Failed to close end-effector controller: {e}")
+
+        def _release_end_effector_controller():
+            try:
+                if args.ee == "dex3":
+                    from teleop.robot_control.robot_hand_unitree import dex3_release_hands
+                    dex3_release_hands(duration=0.6)
+            except Exception as e:
+                logger_mp.error(f"Failed to release end-effector controller: {e}")
+
         def _render_stop_overlay(text="STOPPING..."):
             """Render a status overlay to VR during shutdown."""
             try:
@@ -740,19 +974,30 @@ if __name__ == '__main__':
                 cv2.putText(_fr, text, (w // 2 - 180, h // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
                 tv_wrapper.render_to_xr(_fr)
-                if not args.headless:
-                    cv2.imshow("VR Mirror", _fr)
-                    cv2.waitKey(1)
+                show_pc_mirror(_fr)
             except Exception:
                 pass
 
         _render_stop_overlay("STOPPING...")
+        push_event("Stopping — closing fingers safely...")
+        _close_end_effector_controller()
+        time.sleep(0.2)
         push_event("Stopping — arms returning home...")
 
         _go_home_done = threading.Event()
         def _do_exit_go_home():
             try:
-                arm_ctrl.ctrl_dual_arm_go_home()
+                if args.arm == "G1_29":
+                    arm_ctrl.ctrl_dual_arm_go_home(
+                        lower_to_zero=(args.park_arms_on_stop == "default"),
+                        keep_holder_yield=(args.park_arms_on_stop == "default"),
+                        prepare_hands=False,
+                        spread_min_duration=3.0,
+                        spread_timeout=3.5,
+                        spread_settle=False,
+                    )
+                else:
+                    arm_ctrl.ctrl_dual_arm_go_home()
             except Exception as e:
                 logger_mp.error(f"Failed to ctrl_dual_arm_go_home: {e}")
             finally:
@@ -762,6 +1007,7 @@ if __name__ == '__main__':
             _render_stop_overlay("STOPPING...")
 
         _render_stop_overlay("STOPPED")
+        _release_end_effector_controller()
         push_event("Teleoperation ended")
         time.sleep(1.0)
 
@@ -783,6 +1029,8 @@ if __name__ == '__main__':
             tv_wrapper.close()
         except Exception as e:
             logger_mp.error(f"Failed to close televuer wrapper: {e}")
+
+        _close_end_effector_controller()
 
         try:
             if not args.motion:

@@ -161,8 +161,12 @@ class G1_29_ArmIK:
             _ik_lower[i] *= 0.60
             _ik_upper[i] *= 0.60
 
-        # Disabled joints: lock to q=0 in the optimizer
-        _DISABLED_IK_JOINTS = {5}  # L_WristPitch — match _G1_29_DISABLED_ARM_JOINTS
+        # Disabled joints: lock to q=0 in the optimizer.
+        # 2026-04-27: motor 20 (L_WristPitch) replaced with new hardware;
+        # disabled set {5} reverted to empty. Keep the loop so the constraint
+        # can be re-enabled by adding indices back.
+        # See todo_docs/motor20_wrist_pitch_fault_report.md.
+        _DISABLED_IK_JOINTS: set[int] = set()
         for j in _DISABLED_IK_JOINTS:
             self.opti.subject_to(self.var_q[j] == 0.0)
 
