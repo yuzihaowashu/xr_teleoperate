@@ -3,6 +3,7 @@ import cv2
 import json
 import datetime
 import numpy as np
+import shutil
 import time
 from .rerun_visualizer import RerunLogger
 from queue import Queue, Empty
@@ -11,7 +12,17 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 
 class EpisodeWriter():
-    def __init__(self, task_dir, task_goal=None, task_desc = None, task_steps = None, frequency=30, image_size=[640, 480], rerun_log = True):
+    def __init__(
+        self,
+        task_dir,
+        task_goal=None,
+        task_desc = None,
+        task_steps = None,
+        frequency=30,
+        image_size=[640, 480],
+        rerun_log = True,
+        metadata=None,
+    ):
         """
         image_size: [width, height]
         """
@@ -28,6 +39,7 @@ class EpisodeWriter():
             self.text['desc'] = task_desc
         if task_steps is not None:
             self.text['steps'] = task_steps
+        self.metadata = metadata or {}
 
         self.frequency = frequency
         self.image_size = image_size
@@ -85,6 +97,8 @@ class EpisodeWriter():
                 }, 
                 "sim_state": ""
             }
+        if self.metadata:
+            self.info["metadata"] = self.metadata
 
  
     def create_episode(self):
@@ -208,6 +222,19 @@ class EpisodeWriter():
         """
         self.need_save = True  # Set the save flag
         logger_mp.info(f"==> Episode saved start...")
+
+    def discard_episode(self):
+        """Discard the current episode and delete its partial files."""
+        logger_mp.info("==> Episode discard start...")
+        self.need_save = False
+        self.item_data_queue.join()
+        episode_dir = getattr(self, "episode_dir", None)
+        if episode_dir and os.path.isdir(episode_dir):
+            shutil.rmtree(episode_dir)
+            logger_mp.info(f"==> Episode discarded and deleted: {episode_dir}")
+        if self.episode_id >= 0:
+            self.episode_id -= 1
+        self.is_available = True
 
     def _save_episode(self):
         """

@@ -16,11 +16,13 @@ sys.path.append(parent2_dir)
 from teleop.utils.weighted_moving_filter import WeightedMovingFilter
 
 class G1_29_ArmIK:
-    def __init__(self, Unit_Test = False, Visualization = False):
+    def __init__(self, Unit_Test = False, Visualization = False,
+                 rotation_weight = 1.0):
         np.set_printoptions(precision=5, suppress=True, linewidth=200)
 
         self.Unit_Test = Unit_Test
         self.Visualization = Visualization
+        self.rotation_weight = float(rotation_weight)
 
         # fixed cache file path
         self.cache_path = "g1_29_model_cache.pkl"
@@ -172,7 +174,12 @@ class G1_29_ArmIK:
 
         # Setting optimization constraints and goals
         self.opti.subject_to(self.opti.bounded(_ik_lower, self.var_q, _ik_upper))
-        self.opti.minimize(50 * self.translational_cost + self.rotation_cost + 0.02 * self.regularization_cost + 0.1 * self.smooth_cost)
+        self.opti.minimize(
+            50 * self.translational_cost
+            + self.rotation_weight * self.rotation_cost
+            + 0.02 * self.regularization_cost
+            + 0.1 * self.smooth_cost
+        )
 
         opts = {
             # CasADi-level options
@@ -266,6 +273,18 @@ class G1_29_ArmIK:
         robot_left_pose[:3, 3] *= scale_factor
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
+
+    def ee_pose_from_arm_q(self, q_arm: np.ndarray, side: str) -> np.ndarray:
+        """4×4 homogeneous pose of L_ee or R_ee for reduced-model arm coordinates."""
+        q = np.asarray(q_arm, dtype=np.float64).reshape(-1)
+        if q.shape[0] != self.reduced_robot.model.nq:
+            raise ValueError(
+                f"ee_pose_from_arm_q: expected q dim {self.reduced_robot.model.nq}, got {q.shape[0]}"
+            )
+        pin.forwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        pin.updateFramePlacements(self.reduced_robot.model, self.reduced_robot.data)
+        fid = self.L_hand_id if side == "left" else self.R_hand_id
+        return self.reduced_robot.data.oMf[fid].homogeneous.copy()
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:
@@ -545,6 +564,18 @@ class G1_23_ArmIK:
         robot_left_pose[:3, 3] *= scale_factor
         robot_right_pose[:3, 3] *= scale_factor
         return robot_left_pose, robot_right_pose
+
+    def ee_pose_from_arm_q(self, q_arm: np.ndarray, side: str) -> np.ndarray:
+        """4×4 homogeneous pose of L_ee or R_ee for reduced-model arm coordinates."""
+        q = np.asarray(q_arm, dtype=np.float64).reshape(-1)
+        if q.shape[0] != self.reduced_robot.model.nq:
+            raise ValueError(
+                f"ee_pose_from_arm_q: expected q dim {self.reduced_robot.model.nq}, got {q.shape[0]}"
+            )
+        pin.forwardKinematics(self.reduced_robot.model, self.reduced_robot.data, q)
+        pin.updateFramePlacements(self.reduced_robot.model, self.reduced_robot.data)
+        fid = self.L_hand_id if side == "left" else self.R_hand_id
+        return self.reduced_robot.data.oMf[fid].homogeneous.copy()
 
     def solve_ik(self, left_wrist, right_wrist, current_lr_arm_motor_q = None, current_lr_arm_motor_dq = None):
         if current_lr_arm_motor_q is not None:

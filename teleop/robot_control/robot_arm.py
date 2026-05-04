@@ -190,13 +190,37 @@ def _keep_holder_yielding_until_next_teleop():
 
 class G1_29_ArmController:
     def __init__(self, motion_mode = False, simulation_mode = False,
-                 safe_deploy = True, keep_spread = True):
+                 safe_deploy = True, keep_spread = True,
+                 safe_deploy_q = None,
+                 safe_deploy_via_q = None,
+                 safe_deploy_via_min_duration = 1.0,
+                 safe_deploy_min_duration = 1.0,
+                 safe_deploy_after_via_callback = None,
+                 prepare_hands_on_deploy = True,
+                 wrist_kp = 60.0,
+                 wrist_kd = 2.0):
         """Args:
             motion_mode: publish to rt/arm_sdk (True) or rt/lowcmd (False).
             simulation_mode: skip clip_arm_q_target & velocity limit.
             safe_deploy: in __init__, open hands then spread shoulders
                 outward before user code runs. Strongly recommended for
                 G1+Dex3 to clear the hands from the body.
+            safe_deploy_q: optional 14D target for the safe-deploy hold pose.
+                The default is _SPREAD_Q. Single-arm teleop can pass a mixed
+                pose so the inactive arm does not first move to full spread.
+            safe_deploy_via_q: optional 14D waypoint to visit before
+                safe_deploy_q. Single-arm teleop uses an outward active-arm
+                waypoint to avoid sweeping directly from relaxed/down to q=0.
+            safe_deploy_via_min_duration/safe_deploy_min_duration: timing for
+                the optional waypoint and final deploy target.
+            safe_deploy_after_via_callback: optional callback after the
+                outward waypoint is reached. Used to open Dex3 hands only
+                after the fingers have cleared the legs.
+            prepare_hands_on_deploy: when False, skip the internal Dex3 hand
+                close/release step because an external hand controller is
+                already holding the fingers.
+            wrist_kp/wrist_kd: lower wrist PD gains for smoother controller
+                rotation tracking near the hand.
             keep_spread: when True (default 2026-04-27), the safe-deploy
                 phase 2 ("move to home q=0") is SKIPPED. Reason: the
                 default standing pose collides Dex3-1 fingers with the
@@ -207,6 +231,20 @@ class G1_29_ArmController:
         """
         logger_mp.info("Initialize G1_29_ArmController...")
         self.keep_spread = keep_spread
+        self.safe_deploy_q = (
+            np.asarray(safe_deploy_q, dtype=np.float64).copy()
+            if safe_deploy_q is not None
+            else _SPREAD_Q.copy()
+        )
+        self.safe_deploy_via_q = (
+            np.asarray(safe_deploy_via_q, dtype=np.float64).copy()
+            if safe_deploy_via_q is not None
+            else None
+        )
+        self.safe_deploy_via_min_duration = float(safe_deploy_via_min_duration)
+        self.safe_deploy_min_duration = float(safe_deploy_min_duration)
+        self.safe_deploy_after_via_callback = safe_deploy_after_via_callback
+        self.prepare_hands_on_deploy = bool(prepare_hands_on_deploy)
         self.q_target = np.zeros(14)
         self.tauff_target = np.zeros(14)
         self.motion_mode = motion_mode
@@ -215,8 +253,8 @@ class G1_29_ArmController:
         self.kd_high = 3.0
         self.kp_low = 150.0
         self.kd_low = 3.5
-        self.kp_wrist = 60.0
-        self.kd_wrist = 2.0
+        self.kp_wrist = float(wrist_kp)
+        self.kd_wrist = float(wrist_kd)
         self.kp_waist = 200.0
         self.kd_waist = 5.0
 
@@ -288,28 +326,81 @@ class G1_29_ArmController:
             self.msg.motor_cmd[j].q = 0.0
         logger_mp.info(f"Lock OK! (waist kp={self.kp_waist}, kd={self.kd_waist}, q=0.0)")
 
-        # Ask arm_idle_holder to yield before our publisher starts. Then hold
-        # the current arm pose while the fingers are made compact.
-        if self.motion_mode:
-            _publish_yield_flag()
-
         # initialize publish thread
         self.publish_thread = threading.Thread(target=self._ctrl_motor_state)
         self.ctrl_lock = threading.Lock()
         self.publish_thread.daemon = True
         self.publish_thread.start()
 
-        if safe_deploy:
-            logger_mp.info("[safe_arm_deploy] Phase 0: closing/releasing hands...")
-            _try_open_hands(duration=0.5)
-            logger_mp.info("[safe_arm_deploy] Phase 1: arms spreading outward...")
+        # Start our publisher before asking arm_idle_holder to yield. This
+        # avoids a brief no-publisher window where the arms can sag under
+        # gravity at teleop startup.
+        if self.motion_mode:
+            pre_yield_q = self.get_current_dual_arm_q().copy()
             with self.ctrl_lock:
-                self.q_target = _SPREAD_Q.copy()
-            time.sleep(1.0)
+                self.q_target = pre_yield_q.copy()
+            logger_mp.info("[holder-flag] teleop publisher warmup before yield...")
+            time.sleep(0.75)
+            _publish_yield_flag()
+            logger_mp.info("[holder-flag] arm_idle_holder yielded to teleop.")
+            # Keep commanding the pre-yield pose long enough for arm_sdk
+            # ownership to settle before any deploy waypoint starts moving.
+            hold_until = time.time() + 1.5
+            while time.time() < hold_until:
+                with self.ctrl_lock:
+                    self.q_target = pre_yield_q.copy()
+                time.sleep(0.01)
+
+        if safe_deploy:
+            if self.prepare_hands_on_deploy:
+                logger_mp.info("[safe_arm_deploy] Phase 0: preparing hands...")
+                _try_open_hands(duration=0.5)
+            else:
+                logger_mp.info(
+                    "[safe_arm_deploy] Phase 0: skipped; external hand "
+                    "controller is already active."
+                )
+            after_via_callback_done = False
+            if self.safe_deploy_via_q is not None:
+                logger_mp.info(
+                    "[safe_arm_deploy] Phase 1a: moving through outward "
+                    "clearance waypoint..."
+                )
+                self._move_dual_arm_waypoint(
+                    self.safe_deploy_via_q,
+                    "safe deploy clearance waypoint",
+                    timeout=self.safe_deploy_via_min_duration + 1.0,
+                    min_duration=self.safe_deploy_via_min_duration,
+                    settle=False,
+                )
+                if callable(self.safe_deploy_after_via_callback):
+                    logger_mp.info(
+                        "[safe_arm_deploy] Phase 1a done: running "
+                        "after-via callback..."
+                    )
+                    self.safe_deploy_after_via_callback()
+                    after_via_callback_done = True
+            logger_mp.info("[safe_arm_deploy] Phase 1b: moving to deploy target...")
+            self._move_dual_arm_waypoint(
+                self.safe_deploy_q,
+                "safe deploy final target",
+                timeout=self.safe_deploy_min_duration + 1.0,
+                min_duration=self.safe_deploy_min_duration,
+                settle=False,
+            )
+            if (
+                callable(self.safe_deploy_after_via_callback)
+                and not after_via_callback_done
+            ):
+                logger_mp.info(
+                    "[safe_arm_deploy] Phase 1b done: running "
+                    "after-via callback..."
+                )
+                self.safe_deploy_after_via_callback()
             if self.keep_spread:
                 logger_mp.info(
-                    "[safe_arm_deploy] keep_spread=True → staying at spread "
-                    "(Dex3 collision avoidance). See todo_docs/dex3_hand_error.md."
+                    "[safe_arm_deploy] keep_spread=True → staying at deploy target "
+                    f"{np.round(self.safe_deploy_q, 3).tolist()}"
                 )
             else:
                 logger_mp.info("[safe_arm_deploy] Phase 2: moving to home q=0...")
@@ -519,7 +610,11 @@ class G1_29_ArmController:
                               spread_settle: bool = True,
                               prepare_hands: bool = True,
                               hand_settle_time: float = 0.3,
-                              skip_zero_waypoint: bool = False):
+                              skip_zero_waypoint: bool = False,
+                              park_q = None,
+                              park_via_q = None,
+                              park_via_min_duration: float = None,
+                              park_via_timeout: float = None):
         '''Park the arms safely on teleop exit.
 
         Default behavior (since 2026-04-27): open hands → spread outward →
@@ -544,9 +639,34 @@ class G1_29_ArmController:
         Pass `skip_zero_waypoint=True` to avoid commanding the forward-ish
         q=0 arm pose before releasing arm_sdk control. This is useful when
         q=0 brings Dex3 hands close to the body.
+
+        Pass `park_q` to override the default full-spread parking target.
+        Single-arm teleop uses this to park the active arm outward while
+        keeping the inactive arm in its relaxed hold pose between episodes.
+
+        Pass `park_via_q` to move through a clearance waypoint before
+        `park_q`. This avoids sweeping directly from a relaxed/down pose to
+        the forward q=0 start pose.
+
+        Pass `park_via_min_duration` / `park_via_timeout` to tune the
+        clearance waypoint timing separately from the final park timing.
         '''
         if lower_to_zero is None:
             lower_to_zero = not getattr(self, "keep_spread", True)
+        park_target = (
+            np.asarray(park_q, dtype=np.float64).copy()
+            if park_q is not None
+            else _SPREAD_Q.copy()
+        )
+        park_via_target = (
+            np.asarray(park_via_q, dtype=np.float64).copy()
+            if park_via_q is not None
+            else None
+        )
+        if park_via_min_duration is None:
+            park_via_min_duration = spread_min_duration
+        if park_via_timeout is None:
+            park_via_timeout = spread_timeout
 
         logger_mp.info(
             f"[G1_29_ArmController] ctrl_dual_arm_go_home "
@@ -580,9 +700,16 @@ class G1_29_ArmController:
         elif skip_spread:
             logger_mp.info("[G1_29_ArmController] go_home: skipping spread.")
         else:
-            # Phase 1: spread outward to clear body.
+            if park_via_target is not None:
+                self._move_dual_arm_waypoint(
+                    park_via_target, "moving through park clearance waypoint",
+                    timeout=park_via_timeout,
+                    min_duration=park_via_min_duration,
+                    settle=spread_settle,
+                )
+            # Phase 1: park at the configured safe target.
             self._move_dual_arm_waypoint(
-                _SPREAD_Q, "spreading outward",
+                park_target, "moving to park target",
                 timeout=spread_timeout, min_duration=spread_min_duration,
                 settle=spread_settle,
             )
