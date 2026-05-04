@@ -188,6 +188,8 @@ class Dex3_1_Controller:
         # Shared Arrays for hand states
         self.left_hand_state_array  = Array('d', Dex3_Num_Motors, lock=True)  
         self.right_hand_state_array = Array('d', Dex3_Num_Motors, lock=True)
+        self.left_hand_pressure_array = Array('d', 9 * 12, lock=True)
+        self.right_hand_pressure_array = Array('d', 9 * 12, lock=True)
 
         # initialize subscribe thread
         self.subscribe_state_thread = threading.Thread(target=self._subscribe_hand_state)
@@ -226,7 +228,28 @@ class Dex3_1_Controller:
                 # Update right hand state
                 for idx, id in enumerate(Dex3_1_Right_JointIndex):
                     self.right_hand_state_array[idx] = right_hand_msg.motor_state[id].q
+                self._update_pressure_array(left_hand_msg, self.left_hand_pressure_array)
+                self._update_pressure_array(right_hand_msg, self.right_hand_pressure_array)
             time.sleep(0.002)
+
+    @staticmethod
+    def _update_pressure_array(hand_msg, pressure_array):
+        sensors = getattr(hand_msg, "press_sensor_state", None)
+        if sensors is None:
+            return
+        with pressure_array.get_lock():
+            for sensor_idx in range(9):
+                pressure = getattr(sensors[sensor_idx], "pressure", [])
+                for value_idx in range(12):
+                    value = pressure[value_idx] if value_idx < len(pressure) else 0.0
+                    pressure_array[sensor_idx * 12 + value_idx] = float(value)
+
+    def get_current_dual_hand_pressure(self):
+        with self.left_hand_pressure_array.get_lock():
+            left = list(self.left_hand_pressure_array[:])
+        with self.right_hand_pressure_array.get_lock():
+            right = list(self.right_hand_pressure_array[:])
+        return np.array(left + right, dtype=float)
     
     @staticmethod
     def _make_hand_mode(motor_id, status=0x01, timeout=0):

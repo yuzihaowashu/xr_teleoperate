@@ -1246,6 +1246,17 @@ if __name__ == '__main__':
                     right_hand_action = []
                     current_body_state = []
                     current_body_action = []
+                if args.ee == "dex3" and hand_ctrl is not None:
+                    pressure = hand_ctrl.get_current_dual_hand_pressure().tolist()
+                    tactiles = {
+                        "left_ee": pressure[:108],
+                        "right_ee": pressure[108:],
+                    }
+                else:
+                    tactiles = {
+                        "left_ee": [],
+                        "right_ee": [],
+                    }
 
                 # arm state and action
                 left_arm_state  = current_lr_arm_q[:7]
@@ -1350,9 +1361,9 @@ if __name__ == '__main__':
                     _splitter_state["transition_pending"] = False
                     if args.sim:
                         sim_state = sim_state_subscriber.read_data()            
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, sim_state=sim_state)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles, sim_state=sim_state)
                     else:
-                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions)
+                        recorder.add_item(colors=colors, depths=depths, states=states, actions=actions, tactiles=tactiles)
 
             current_time = time.time()
             time_elapsed = current_time - start_time
